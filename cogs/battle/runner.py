@@ -183,6 +183,11 @@ class Battle:
                            and dmg >= def_mon.hp)
             if sturdy_save:
                 dmg = def_mon.hp - 1
+            sash_save = (not sturdy_save and def_mon.item == "focus-sash" and not def_mon.item_used
+                         and def_mon.hp == def_mon.max_hp and dmg >= def_mon.hp)
+            if sash_save:
+                dmg = def_mon.hp - 1
+                def_mon.item_used = True
             prev_def_hp = def_mon.hp
             def_mon.hp = max(0, def_mon.hp - dmg)
             actual_dealt = prev_def_hp - def_mon.hp
@@ -199,6 +204,8 @@ class Battle:
             lines.append(text)
             if sturdy_save:
                 lines.append(f"🛡️ {def_mon.name.title()} hung on with Sturdy!")
+            if sash_save:
+                lines.append(f"🎗️ {def_mon.name.title()} hung on using its Focus Sash!")
 
             # Shell Bell: heals the attacker for a slice of the damage it
             # just dealt. Mild by design (1/8), and skipped if the
@@ -208,6 +215,10 @@ class Battle:
                 if healed > 0:
                     atk_mon.hp += healed
                     lines.append(f"🔔 {atk_mon.name.title()}'s Shell Bell restored **{healed}** HP!")
+            if atk_mon.item == "life-orb" and actual_dealt > 0 and not atk_mon.fainted:
+                recoil = max(1, atk_mon.max_hp // 10)
+                atk_mon.hp = max(0, atk_mon.hp - recoil)
+                lines.append(f"🔮 {atk_mon.name.title()} lost **{recoil}** HP to its Life Orb!")
         else:
             lines.append(f"➡️ {atk_mon.name.title()} used **{move_name}**!")
 
@@ -302,6 +313,11 @@ class Battle:
             f"— all Pokémon are Level {LEVEL}."
         )
 
+        for _t in (self.t1, self.t2):
+            _q = _t.quotes.get("intro")
+            if _q:
+                await self.channel.send(f"💬 **{_t.title or _t.user.display_name}**: *{_q}*")
+
         # Intimidate can trigger from the very first send-out, same as
         # every later switch-in.
         start_lines = (self._apply_switch_in_abilities(self.t1, self.t2)
@@ -336,6 +352,9 @@ class Battle:
                 other = self.t2 if trainer is self.t1 else self.t1
                 switch_in_lines = self._apply_switch_in_abilities(trainer, other)
                 msg = f"{trainer.user.display_name} sent out **{trainer.active.name.title()}**!"
+                if trainer.quotes.get("ace") and not trainer.ace_announced and len(trainer.alive_team) == 1:
+                    trainer.ace_announced = True
+                    msg += f"\n🔥 **{trainer.title or trainer.user.display_name}**: *{trainer.quotes['ace']}*"
                 if switch_in_lines:
                     msg += "\n" + "\n".join(switch_in_lines)
                 await self.channel.send(msg)
@@ -417,6 +436,8 @@ class Battle:
                         f"🧪 {trainer.user.display_name} used a **Hyper Potion** on "
                         f"{mon.name.title()}! (+{mon.hp - before} HP, {trainer.heals_left} left)"
                     )
+                    if trainer.quotes.get("heal"):
+                        lines.append(f"💬 *{trainer.quotes['heal']}*")
                 elif action and action[0] == "pass":
                     lines.append(f"⏭️ {trainer.user.display_name} passed the turn.")
                 elif action and action[0] == "recharge":
