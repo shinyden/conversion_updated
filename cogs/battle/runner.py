@@ -7,7 +7,7 @@ bookkeeping (win/loss stats, Elo, rematch prompt).
 
 import asyncio
 import random
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, Sequence, Tuple, TYPE_CHECKING
 
 import discord
 
@@ -24,7 +24,7 @@ from .engine import (
     _status_precheck, _apply_drain_recoil, _apply_flinch,
 )
 from .render import (
-    pick_background, render_battle_scene, render_quote_card, render_text_banner,
+    pick_background, render_battle_scene, TYPE_COLORS,
 )
 from .trainer_ai import Trainer
 from .ui import BattlePanel, ForcedSwitchView, RematchView
@@ -130,31 +130,28 @@ class Battle:
         embed.set_footer(text="⏳ Next turn is coming up shortly...")
         return embed
 
-    async def _quote_file(self, trainer: Trainer, key: str, filename: str,
-                          chips=()) -> Optional[discord.File]:
-        """Image card of a trainer's quote (intro/ace/win/lose) with their
-        sprite, or None if they have no such quote / Pillow is missing.
-        The sprite is looked up by `sprite_name` (falling back to the title,
-        then the display name); a placeholder badge is drawn if not found."""
+    def _quote_embed(self, trainer: Trainer, key: str,
+                      chips: Sequence[str] = ()) -> Optional[discord.Embed]:
+        """Small text embed of a trainer's quote (intro/ace/win/lose), or
+        None if they have no such quote for this key. Replaces the old
+        Pillow-rendered quote-card image — same information (speaker,
+        title, accent colour, quote, any chip labels), just as an embed."""
         quote = trainer.quotes.get(key)
         if not quote:
             return None
-        speaker = trainer.sprite_name or trainer.title or trainer.user.display_name
-        try:
-            return await render_quote_card(
-                self.cog.session, speaker, quote,
-                title=(trainer.title if trainer.title != speaker else None),
-                accent_type=trainer.accent_type or None,
-                chips=chips, background=self.background, filename=filename,
-            )
-        except Exception:
-            return None
+        accent = TYPE_COLORS.get((trainer.accent_type or "").lower(), (230, 170, 20))
+        speaker = trainer.title or trainer.user.display_name
+        embed = discord.Embed(description=f"💬 *{quote}*", colour=discord.Colour.from_rgb(*accent))
+        embed.set_author(name=speaker, icon_url=trainer.user.display_avatar.url)
+        if chips:
+            embed.set_footer(text=" · ".join(chips))
+        return embed
 
-    async def _send_files(self, content: Optional[str], files: list, **kwargs):
-        """One message carrying text + any number of image cards."""
-        files = [f for f in files if f is not None]
-        if files:
-            return await self.channel.send(content=content, files=files, **kwargs)
+    async def _send_with_embeds(self, content: Optional[str], embeds: list, **kwargs):
+        """One message carrying text + any number of quote/info embeds."""
+        embeds = [e for e in embeds if e is not None]
+        if embeds:
+            return await self.channel.send(content=content, embeds=embeds, **kwargs)
         if content:
             return await self.channel.send(content, **kwargs)
 
@@ -338,36 +335,31 @@ class Battle:
         return await future
 
     async def run(self):
-        # Everything that used to be 3-5 separate start messages (battle
-        # start, difficulty, shiny notice, intro quotes, Intimidate) now goes
-        # out as ONE message: a banner card, one quote card per trainer with
-        # an intro quote, and any switch-in ability lines as the text.
-        # Intimidate can trigger from the very first send-out, same as
-        # every later switch-in.
+        # Battle-start message: plain text (who's fighting, level, difficulty,
+        # shiny notice, any Intimidate-on-send-out lines) plus one quote
+        # embed per trainer that has an intro line. No banner/quote-card
+        # images anymore.
         start_lines = (self._apply_switch_in_abilities(self.t1, self.t2)
                        + self._apply_switch_in_abilities(self.t2, self.t1))
 
-        chips = [(f"Lv.{LEVEL}", (70, 110, 200))]
+        info_bits = [f"Lv.{LEVEL}"]
         if self.t1.hard or self.t2.hard:
-            chips.append(("Gym Leader · Hard", (200, 80, 60)))
+            info_bits.append("Gym Leader · Hard")
         shiny_names = [p.name.title() for t in (self.t1, self.t2) for p in t.team
                        if getattr(p, "shiny", False)]
         if shiny_names:
-            chips.append((f"★ Shiny: {', '.join(shiny_names[:3])}", (230, 170, 20)))
+            info_bits.append(f"✨ Shiny: {', '.join(shiny_names[:3])}")
 
-        banner = await render_text_banner(
-            f"{self.t1.user.display_name}  vs  {self.t2.user.display_name}",
-            subtitle="⚔️ Battle Start", chips=chips,
-            background=self.background, filename="start.png",
+        content = (
+            f"{self.t1.user.mention} {self.t2.user.mention}\n"
+            f"⚔️ **Battle Start!** {self.t1.user.display_name} vs {self.t2.user.display_name} "
+            f"({' · '.join(info_bits)})"
         )
-        files = [banner]
-        for n, _t in enumerate((self.t1, self.t2)):
-            files.append(await self._quote_file(_t, "intro", f"intro_{n}.png"))
-
-        content = f"{self.t1.user.mention} {self.t2.user.mention}"
         if start_lines:
             content += "\n" + "\n".join(start_lines)
-        await self._send_files(content, files)
+
+        intro_embeds = [self._quote_embed(_t, "intro") for _t in (self.t1, self.t2)]
+        await self._send_with_embeds(content, intro_embeds)
 
         turn = 1
         last_summary: Optional[str] = None
@@ -396,17 +388,13 @@ class Battle:
                 other = self.t2 if trainer is self.t1 else self.t1
                 switch_in_lines = self._apply_switch_in_abilities(trainer, other)
                 msg = f"{trainer.user.display_name} sent out **{trainer.active.name.title()}**!"
-                ace_file = None
+                ace_embed = None
                 if trainer.quotes.get("ace") and not trainer.ace_announced and len(trainer.alive_team) == 1:
                     trainer.ace_announced = True
-                    ace_file = await self._quote_file(
-                        trainer, "ace", "ace.png",
-                        chips=[("🔥 Final Pokémon", (200, 80, 60))])
-                    if ace_file is None:
-                        msg += f"\n🔥 **{trainer.title or trainer.user.display_name}**: *{trainer.quotes['ace']}*"
+                    ace_embed = self._quote_embed(trainer, "ace", chips=["🔥 Final Pokémon"])
                 if switch_in_lines:
                     msg += "\n" + "\n".join(switch_in_lines)
-                await self._send_files(msg, [ace_file])
+                await self._send_with_embeds(msg, [ace_embed])
             pending_switches = []
 
             # A forfeit may have landed while there was no panel open (e.g.
@@ -683,16 +671,11 @@ class Battle:
             except Exception:
                 pass  # never let rating logging break the battle's end
 
-        end_files = [await render_text_banner(
-            "Victory!", subtitle=f"{winner.user.display_name} wins the battle",
-            chips=[("GG", (60, 160, 90))], background=self.background, filename="victory.png",
-        )]
-        # Gym leader's win/lose line as a quote card, if they have one.
-        for _t, _key, _fn in ((winner, "win", "win_quote.png"), (loser, "lose", "lose_quote.png")):
-            end_files.append(await self._quote_file(_t, _key, _fn))
-        await self._send_files(
-            f"🏆 {winner.user.mention} wins the battle! GG {loser.user.display_name}.{elo_note}",
-            end_files,
+        # Gym leader's win/lose line as a quote embed, if they have one.
+        end_embeds = [self._quote_embed(_t, _key) for _t, _key in ((winner, "win"), (loser, "lose"))]
+        await self._send_with_embeds(
+            f"🏆 **Victory!** {winner.user.mention} wins the battle! GG {loser.user.display_name}.{elo_note}",
+            end_embeds,
         )
 
         self.cog.active_battles.pop(self.channel.id, None)
