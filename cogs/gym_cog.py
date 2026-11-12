@@ -50,7 +50,73 @@ from discord.ext import commands
 from .battle.constants import LEVEL, GYM_TYPES, GYM_TYPE_EMOJI, GYM_BADGE_NAME, GYM_TOTAL_BADGES
 from .battle.pokeapi import get_pokemon_data, pick_moves, build_gym_team
 from .battle.engine import BattlePokemon
+import random
 from .battle.trainer_ai import Trainer, pick_best_replacement
+
+# Difficulty by badges already earned: (min_badges, name, stat boost, ace boost, heals)
+GYM_TIERS = [
+    (0, "Rookie", 1.05, 1.15, 1),
+    (2, "Veteran", 1.10, 1.20, 2),
+    (5, "Elite", 1.15, 1.25, 3),
+    (8, "Champion", 1.20, 1.30, 3),
+]
+
+
+def _gym_tier(badges: int):
+    tier = GYM_TIERS[0]
+    for t in GYM_TIERS:
+        if badges >= t[0]:
+            tier = t
+    return tier
+
+
+QUOTES = {
+    "intro": ["So you're the challenger? My {t} team doesn't go down easy!",
+              "I've scouted your team. Let's see if you can handle {t} type pressure!",
+              "Welcome to the {t} Gym! Show me what you've got!"],
+    "ace": ["Don't blink — this is my ace, my pride and joy!",
+            "You pushed me this far... now face my strongest!",
+            "Impressive! But my ace has never lost a gym match!"],
+    "heal": ["Not so fast — I'm not done yet!", "A little pick-me-up never hurt anyone!",
+             "Hang in there, partner!"],
+    "win": ["Better luck next time, challenger. Train harder!",
+            "My {t} team stays undefeated today!"],
+    "lose": ["Incredible... you've earned this badge.",
+             "Well fought! The {t} Gym acknowledges your strength."],
+}
+
+
+def _quotes(gym_type: str) -> dict:
+    t = gym_type.title()
+    return {k: random.choice(v).format(t=t) for k, v in QUOTES.items()}
+
+
+def make_shiny(mon):
+    """Swap in the shiny sprite (PokeAPI URL pattern) and flag the mon."""
+    url = mon.sprite or ""
+    if "/pokemon/" in url and "/shiny/" not in url:
+        mon.sprite = url.replace("/pokemon/", "/pokemon/shiny/", 1)
+    mon.shiny = True
+
+
+def assign_gym_items(team: list, player_team: list):
+    """Every gym Pokemon gets a purposeful held item: lead = Focus Sash,
+    ace = Life Orb/Assault Vest, slower-than-player mons = Choice Scarf,
+    the rest random from the support pool."""
+    fastest = max((p.spe for p in player_team), default=0)
+    pool = ["leftovers", "sitrus-berry", "shell-bell", "expert-belt"]
+    random.shuffle(pool)
+    for n, mon in enumerate(team):
+        if n == 0 and len(team) > 1:
+            item = "focus-sash"
+        elif n == len(team) - 1:
+            item = "assault-vest" if (mon.dfn + mon.spd) > (mon.atk + mon.spa) else "life-orb"
+        elif mon.spe < fastest:
+            item = "choice-scarf"
+        else:
+            item = pool.pop() if pool else "leftovers"
+        mon.item = item
+        mon.item_used = False
 from .battle.runner import Battle
 
 import db as _db
@@ -214,17 +280,28 @@ class GymCog(commands.Cog, name="Gym"):
         )
         ai_team = await build_gym_team(self.session, pending.gym_type, pending.team, pending.count)
 
-        # Gym leaders are trained: +10% stats, and their ace (last mon) gets +20%.
+        # Difficulty scales with how many badges the challenger already holds.
+        guild_id = ctx.guild.id if ctx.guild else 0
+        try:
+            badges = await _db.get_gym_badge_count(guild_id, pending.trainer.id)
+        except Exception:
+            badges = 0
+        tier_name, base_boost, ace_boost, tier_heals = _gym_tier(badges)[1:]
+
         for n, mon in enumerate(ai_team):
-            boost = 1.20 if (n == len(ai_team) - 1 and len(ai_team) > 1) else 1.10
+            boost = ace_boost if (n == len(ai_team) - 1 and len(ai_team) > 1) else base_boost
             for stat in ("atk", "dfn", "spa", "spd", "spe"):
                 setattr(mon, stat, int(getattr(mon, stat) * boost))
             mon.max_hp = int(mon.max_hp * boost)
             mon.hp = mon.max_hp
 
         t1 = Trainer(pending.trainer, team=pending.team)
+        for mon in ai_team:
+            make_shiny(mon)
+        quotes = _quotes(pending.gym_type)
         t2 = Trainer(self.bot.user, team=ai_team, is_bot=True, hard=True,
-                     heals_left=2 if pending.count >= 3 else 1)
+                     title=f"{pending.gym_type.title()} Gym Leader", quotes=quotes,
+                     heals_left=tier_heals if pending.count >= 3 else 1)
 
         # Smart lead: best matchup vs the player's lead (the ace stays last).
         if len(ai_team) > 2:
@@ -234,6 +311,7 @@ class GymCog(commands.Cog, name="Gym"):
             body.insert(0, body.pop(lead))
             t2.team = body + [ai_team[-1]]
         ai_team = t2.team
+        assign_gym_items(ai_team, pending.team)
 
         battle = Battle(battle_cog, ctx.channel, t1, t2, fmt="random",
                          count=pending.count, vs_bot=True)
@@ -242,8 +320,10 @@ class GymCog(commands.Cog, name="Gym"):
             f"⚔️ **Gym battle start!** {pending.trainer.mention} vs the "
             f"{emoji} **{pending.gym_type.title()} Gym** — Level {LEVEL}, "
             f"{pending.count} Pokémon each.\n"
-            f"💪 Gym leader Pokémon are trained (+10% stats, ace +20%) and carry "
-            f"**{t2.heals_left} Hyper Potion(s)**."
+            f"💪 Difficulty: **{tier_name}** ({badges} badges) — trained Pokémon "
+            f"(+{round((base_boost-1)*100)}% stats, ace +{round((ace_boost-1)*100)}%), "
+            f"held items, and **{t2.heals_left} Hyper Potion(s)**.\n"
+            f"✨ Every gym Pokémon is **shiny**!"
         )
         await battle.run()
 
@@ -251,6 +331,7 @@ class GymCog(commands.Cog, name="Gym"):
         # channel out of active_battles — figure out the outcome from the
         # Trainer objects it mutated in place and award the badge.
         human_won = (battle.forfeited_trainer is not t1) and bool(t1.alive_team)
+        await ctx.send(f"💬 **{t2.title}**: *{quotes['lose' if human_won else 'win']}*")
         if human_won:
             guild_id = ctx.guild.id if ctx.guild else 0
             is_new = await _db.award_gym_badge(guild_id, pending.trainer.id, pending.gym_type)
