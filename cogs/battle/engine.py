@@ -108,6 +108,10 @@ class BattlePokemon:
             value *= 1.5
         if key == "spe" and self.status == "paralysis":
             value *= 0.5
+        if key == "spe" and self.item == "choice-scarf":
+            value *= 1.5
+        elif key == "spd" and self.item == "assault-vest":
+            value *= 1.5
         return value
 
 
@@ -125,7 +129,12 @@ def calc_damage(attacker: BattlePokemon, defender: BattlePokemon, move: dict):
     crit_mult = 1.5 if crit else 1.0
     rand = random.uniform(0.85, 1.0)
     base = (((2 * LEVEL / 5 + 2) * power * a / max(d, 1)) / 50 + 2)
-    dmg = int(base * stab * eff * crit_mult * rand)
+    item_mult = 1.0
+    if attacker.item == "life-orb":
+        item_mult = 1.3
+    elif attacker.item == "expert-belt" and eff > 1:
+        item_mult = 1.2
+    dmg = int(base * stab * eff * crit_mult * rand * item_mult)
     return max(dmg, 1), eff, crit
 
 
