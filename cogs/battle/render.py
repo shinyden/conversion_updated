@@ -2,12 +2,14 @@
 cogs/battle/render.py
 ────────────────────────
 Battle scene image rendering (Pillow) — background presets, sprite
-fetching, and the HP-bar overlay.
+fetching, the HP-bar overlay, plus image "cards" (gym leader quotes,
+battle intro, text banners) that replace crowded text messages.
 """
 
 import io
 import random
-from typing import Optional, TYPE_CHECKING
+import re
+from typing import Optional, Sequence, Tuple, TYPE_CHECKING
 
 import aiohttp
 import discord
@@ -52,9 +54,6 @@ def pick_background() -> dict:
     preset = dict(random.choice(BACKGROUNDS))
     preset["seed"] = random.randint(0, 1_000_000_000)
     return preset
-
-
-_FONT_CACHE: dict = {}
 
 
 _FONT_CACHE: dict = {}
@@ -133,6 +132,33 @@ async def _fetch_sprite(session: aiohttp.ClientSession, url: str):
         return Image.open(io.BytesIO(raw)).convert("RGBA")
     except Exception:
         return None
+
+
+def _normal_sprite_url(url: str) -> Optional[str]:
+    """Derive the non-shiny URL from a shiny sprite URL (PokeAPI-style
+    '/shiny/' folders, Showdown-style '-shiny' folders, or '_shiny' suffixes).
+    Returns None if the URL doesn't look shiny."""
+    if not url:
+        return None
+    for old, new in (("/shiny/", "/"), ("-shiny/", "/"), ("_shiny", "")):
+        if old in url:
+            return url.replace(old, new, 1)
+    return None
+
+
+async def _fetch_sprite_with_fallback(session: aiohttp.ClientSession, url: str):
+    """Fetch a sprite; if it's a shiny URL that doesn't exist (404 / bad
+    image), retry with the normal sprite so the Pokemon never renders blank.
+    Returns (image_or_None, used_fallback: bool)."""
+    img = await _fetch_sprite(session, url)
+    if img is not None:
+        return img, False
+    normal = _normal_sprite_url(url)
+    if normal:
+        img = await _fetch_sprite(session, normal)
+        if img is not None:
+            return img, True
+    return None, False
 
 
 def _draw_hp_bar_above(draw: "ImageDraw.ImageDraw", center_x: float, sprite_top_y: float,
@@ -252,10 +278,13 @@ async def render_battle_scene(session: aiohttp.ClientSession,
                                player_pokemon: "BattlePokemon",
                                background: Optional[dict] = None) -> Optional[discord.File]:
     """Classic side-on battle scene: opponent upper-right facing player,
-    player's pokemon lower-left (mi rrored) facing opponent, with an HP bar
+    player's pokemon lower-left (mirrored) facing opponent, with an HP bar
     rendered directly above each sprite (name, Lv.100, colour-shifting bar).
     `background` is one of the presets in BACKGROUNDS (a season/time-of-day
-    combo); if omitted, one is rolled on the spot."""
+    combo); if omitted, one is rolled on the spot.
+
+    If a shiny sprite URL doesn't exist, the normal sprite is used instead
+    (the shiny star/sparkles are still drawn so the Pokemon reads as shiny)."""
     if not PIL_OK:
         return None
 
@@ -271,8 +300,8 @@ async def render_battle_scene(session: aiohttp.ClientSession,
     draw.ellipse([CANVAS_W * 0.14 - 120, CANVAS_H - 95, CANVAS_W * 0.14 + 120, CANVAS_H - 45],
                  fill=bg["patch"])
 
-    opp_sprite = await _fetch_sprite(session, opponent_pokemon.sprite)
-    player_sprite = await _fetch_sprite(session, player_pokemon.sprite)
+    opp_sprite, _ = await _fetch_sprite_with_fallback(session, opponent_pokemon.sprite)
+    player_sprite, _ = await _fetch_sprite_with_fallback(session, player_pokemon.sprite)
 
     opp_pos = (int(CANVAS_W * 0.60), 68)
     player_pos = (int(CANVAS_W * 0.06), CANVAS_H - 232)
@@ -328,3 +357,234 @@ async def render_battle_scene(session: aiohttp.ClientSession,
     canvas.convert("RGB").save(buf, format="PNG")
     buf.seek(0)
     return discord.File(buf, filename="battle.png")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  IMAGE CARDS — gym leader quotes, battle intro, text banners
+# ══════════════════════════════════════════════════════════════════════════
+
+TRAINER_SPRITE_URL = "https://play.pokemonshowdown.com/sprites/trainers/{slug}.png"
+
+# Display names that don't slugify to the Showdown file name.
+_TRAINER_SLUG_ALIASES = {
+    "ltsurge": "ltsurge", "lt.surge": "ltsurge", "ltsurge ": "ltsurge",
+    "tate&liza": "tateandliza", "tateandliza": "tateandliza",
+    "crasherwake": "crasherwake", "crasher wake": "crasherwake",
+}
+
+_TRAINER_SPRITE_CACHE: dict = {}
+
+# Accent colours per Pokemon type, used for the card's border/name plate
+# when a gym leader's type is passed in.
+TYPE_COLORS = {
+    "normal": (168, 168, 120), "fire": (240, 128, 48), "water": (104, 144, 240),
+    "electric": (248, 208, 48), "grass": (120, 200, 80), "ice": (152, 216, 216),
+    "fighting": (192, 48, 40), "poison": (160, 64, 160), "ground": (224, 192, 104),
+    "flying": (168, 144, 240), "psychic": (248, 88, 136), "bug": (168, 184, 32),
+    "rock": (184, 160, 56), "ghost": (112, 88, 152), "dragon": (112, 56, 248),
+    "dark": (112, 88, 72), "steel": (184, 184, 208), "fairy": (238, 153, 172),
+}
+
+
+def _trainer_slug(name: str) -> str:
+    key = re.sub(r"\s+", "", name.lower())
+    if key in _TRAINER_SLUG_ALIASES:
+        return _TRAINER_SLUG_ALIASES[key]
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+async def fetch_trainer_sprite(session: aiohttp.ClientSession, name: str):
+    """Fetch a gym leader / trainer sprite by name from Pokemon Showdown's
+    trainer sprite set (e.g. 'Brock', 'Lt. Surge'). Cached per slug.
+    Returns an RGBA Image, or None if it can't be fetched (callers then draw
+    a placeholder badge, so the card never breaks)."""
+    if not PIL_OK:
+        return None
+    slug = _trainer_slug(name)
+    if slug in _TRAINER_SPRITE_CACHE:
+        return _TRAINER_SPRITE_CACHE[slug]
+    img = await _fetch_sprite(session, TRAINER_SPRITE_URL.format(slug=slug))
+    _TRAINER_SPRITE_CACHE[slug] = img
+    return img
+
+
+def _wrap_text(draw, text: str, font, max_w: int) -> list:
+    lines, cur = [], ""
+    for word in text.split():
+        trial = f"{cur} {word}".strip()
+        if draw.textlength(trial, font=font) <= max_w:
+            cur = trial
+        else:
+            if cur:
+                lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _draw_chip(draw, x: int, y: int, label: str, color, font_size: int = 12) -> int:
+    """Draw a rounded pill; returns its width so callers can lay out a row."""
+    f = _font(font_size)
+    tb = draw.textbbox((0, 0), label, font=f)
+    w, h = (tb[2] - tb[0]) + 16, font_size + 10
+    draw.rounded_rectangle([x, y, x + w, y + h], radius=h // 2, fill=color + (255,) if len(color) == 3 else color)
+    draw.text((x + 8, y + 4), label, font=f, fill=(255, 255, 255, 255))
+    return w
+
+
+def _card_background(width: int, height: int, bg: Optional[dict]) -> "Image.Image":
+    """Sky-to-ground gradient card background reusing the battle presets, so
+    cards visually match the battle scene."""
+    bg = bg or pick_background()
+    img = Image.new("RGBA", (width, height), bg["sky"])
+    d = ImageDraw.Draw(img)
+    top = _mix(bg["sky"], (0, 0, 0), 0.25)
+    bot = _mix(bg["ground"], (0, 0, 0), 0.10)
+    for y in range(height):
+        d.line([(0, y), (width, y)], fill=_mix(top, bot, y / max(height - 1, 1)))
+    rng = random.Random(bg.get("seed", 0))
+    if bg["time"] == "night":
+        for _ in range(30):
+            sx, sy = rng.randint(0, width), rng.randint(0, height // 2)
+            d.ellipse([sx, sy, sx + 2, sy + 2], fill=(255, 255, 255, 200))
+    return img
+
+
+async def render_quote_card(session: aiohttp.ClientSession,
+                            speaker: str,
+                            quote: str,
+                            title: Optional[str] = None,
+                            accent_type: Optional[str] = None,
+                            chips: Sequence[Tuple[str, Tuple[int, ...]]] = (),
+                            background: Optional[dict] = None,
+                            filename: str = "quote.png") -> Optional[discord.File]:
+    """Image card: trainer sprite on the left, speech bubble with the quote on
+    the right, name plate underneath, and an optional row of info chips
+    (difficulty, shiny, weather, ...) along the bottom.
+
+        file = await render_quote_card(
+            session, "Brock", "My rock-hard willpower is evident even in my Pokémon!",
+            title="Pewter City Gym Leader", accent_type="rock",
+            chips=[("Hard", (200, 80, 60)), ("★ Shiny", (230, 170, 20))])
+        await ctx.send(file=file)
+
+    `speaker` is used to look up the sprite (Showdown trainer sprites).
+    If the sprite can't be fetched, a circular initial badge is drawn instead.
+    """
+    if not PIL_OK:
+        return None
+
+    accent = TYPE_COLORS.get((accent_type or "").lower(), (230, 170, 20))
+    W = CANVAS_W
+    quote_font = _font(17, bold=False)
+    probe = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
+    bubble_x, bubble_w = 190, W - 190 - 24
+    lines = _wrap_text(probe, f"“{quote}”", quote_font, bubble_w - 36)
+    bubble_h = max(96, 24 + len(lines) * 24)
+    chips_h = 34 if chips else 0
+    H = max(210, 36 + bubble_h + 24 + chips_h + 16)
+
+    canvas = _card_background(W, H, background)
+    draw = ImageDraw.Draw(canvas)
+
+    # Border in the accent colour.
+    draw.rounded_rectangle([3, 3, W - 4, H - 4], radius=16, outline=accent + (255,), width=4)
+
+    # Trainer sprite (scaled up, bottom-left) or fallback badge.
+    sprite = await fetch_trainer_sprite(session, speaker)
+    sprite_cx, sprite_base = 95, H - (chips_h + 40 if chips else 52)
+    if sprite:
+        scale = max(1, min(3, (H - 90) // max(sprite.height, 1)))
+        sprite = sprite.resize((sprite.width * scale, sprite.height * scale), Image.NEAREST)
+        shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        ImageDraw.Draw(shadow).ellipse(
+            [sprite_cx - sprite.width * 0.4, sprite_base - 8, sprite_cx + sprite.width * 0.4, sprite_base + 10],
+            fill=(0, 0, 0, 90))
+        canvas = Image.alpha_composite(canvas, shadow)
+        canvas.alpha_composite(sprite, (int(sprite_cx - sprite.width / 2), int(sprite_base - sprite.height)))
+        draw = ImageDraw.Draw(canvas)
+    else:
+        r = 48
+        draw.ellipse([sprite_cx - r, sprite_base - 2 * r, sprite_cx + r, sprite_base], fill=accent + (255,),
+                     outline=(255, 255, 255, 255), width=3)
+        initial = (speaker[:1] or "?").upper()
+        tb = draw.textbbox((0, 0), initial, font=_font(44))
+        draw.text((sprite_cx - (tb[2] - tb[0]) / 2, sprite_base - r - (tb[3] - tb[1]) / 2 - 6),
+                  initial, font=_font(44), fill=(255, 255, 255, 255))
+
+    # Speech bubble with a little tail pointing at the speaker.
+    by = 22
+    draw.rounded_rectangle([bubble_x, by, bubble_x + bubble_w, by + bubble_h], radius=14,
+                           fill=(255, 255, 255, 240), outline=(40, 40, 40, 255), width=2)
+    ty = by + bubble_h // 2 - 8
+    draw.polygon([(bubble_x, ty), (bubble_x - 16, ty + 8), (bubble_x, ty + 18)],
+                 fill=(255, 255, 255, 240), outline=(40, 40, 40, 255))
+    draw.line([(bubble_x, ty + 1), (bubble_x, ty + 17)], fill=(255, 255, 255, 240), width=3)
+    text_y = by + (bubble_h - len(lines) * 24) // 2
+    for i, line in enumerate(lines):
+        draw.text((bubble_x + 18, text_y + i * 24), line, font=quote_font, fill=(25, 25, 25, 255))
+
+    # Name plate under the bubble, aligned with the sprite's feet.
+    plate_y = by + bubble_h + 10
+    draw.rounded_rectangle([bubble_x, plate_y, bubble_x + bubble_w, plate_y + 40], radius=10,
+                           fill=accent + (255,))
+    draw.text((bubble_x + 14, plate_y + 3), speaker, font=_font(17), fill=(255, 255, 255, 255))
+    if title:
+        draw.text((bubble_x + 14, plate_y + 22), title, font=_font(11, bold=False), fill=(255, 255, 255, 235))
+
+    # Info chips row (difficulty, shiny, etc.).
+    if chips:
+        cx, cy = 20, H - chips_h - 10
+        for label, color in chips:
+            cx += _draw_chip(draw, cx, cy, label, tuple(color)) + 8
+            if cx > W - 40:
+                break
+
+    buf = io.BytesIO()
+    canvas.convert("RGB").save(buf, format="PNG")
+    buf.seek(0)
+    return discord.File(buf, filename=filename)
+
+
+async def render_text_banner(text: str,
+                             subtitle: Optional[str] = None,
+                             color: Tuple[int, int, int] = (230, 170, 20),
+                             chips: Sequence[Tuple[str, Tuple[int, ...]]] = (),
+                             background: Optional[dict] = None,
+                             filename: str = "banner.png") -> Optional[discord.File]:
+    """Generic text-as-image banner for any message that would otherwise be a
+    plain text line: 'Victory!', 'Battle Start', 'Pikachu fainted!',
+    'Turn 3', 'Level Up' ... A big title, optional subtitle and chip row on a
+    season/time themed gradient."""
+    if not PIL_OK:
+        return None
+    W = CANVAS_W
+    H = 100 + (24 if subtitle else 0) + (34 if chips else 0)
+    canvas = _card_background(W, H, background)
+    draw = ImageDraw.Draw(canvas)
+    draw.rounded_rectangle([3, 3, W - 4, H - 4], radius=16, outline=color + (255,), width=4)
+
+    title_font = _font(34)
+    tw = draw.textlength(text, font=title_font)
+    ty = 18
+    # Soft shadow for legibility on any background.
+    draw.text(((W - tw) / 2 + 2, ty + 2), text, font=title_font, fill=(0, 0, 0, 160))
+    draw.text(((W - tw) / 2, ty), text, font=title_font, fill=(255, 255, 255, 255))
+    y = ty + 48
+    if subtitle:
+        sf = _font(15, bold=False)
+        sw = draw.textlength(subtitle, font=sf)
+        draw.text(((W - sw) / 2, y), subtitle, font=sf, fill=(245, 245, 245, 255))
+        y += 26
+    if chips:
+        widths = [draw.textlength(lbl, font=_font(12)) + 16 + 8 for lbl, _ in chips]
+        cx = (W - sum(widths) + 8) / 2
+        for (label, col), w in zip(chips, widths):
+            _draw_chip(draw, int(cx), y + 2, label, tuple(col))
+            cx += w
+
+    buf = io.BytesIO()
+    canvas.convert("RGB").save(buf, format="PNG")
+    buf.seek(0)
+    return discord.File(buf, filename=filename)
