@@ -21,6 +21,9 @@ class Trainer:
     team: list = field(default_factory=list)
     active_idx: int = 0
     is_bot: bool = False  # True for the bot's own side in a `!battle @bot` fight
+    heals_left: int = 0       # Hyper Potions the AI can still use (gym leaders)
+    switch_cooldown: int = 0  # AI can't voluntarily switch while > 0 (stops ping-pong switching)
+    hard: bool = False        # gym-leader mode
 
     @property
     def active(self) -> BattlePokemon:
@@ -52,6 +55,11 @@ def estimate_damage(attacker: BattlePokemon, defender: BattlePokemon, move: dict
 
 SWITCH_HP_THRESHOLD = 0.25       # consider switching if best move clears less than this % of foe's HP
 SWITCH_INCOMING_THRESHOLD = 0.5  # ...or if the foe's predicted hit would take this much of OUR current HP
+SWITCH_MIN_HP = 0.5        # never voluntarily bring in a bench mon below this HP fraction
+SWITCH_MAX_INCOMING = 0.6  # ...or one the foe's best hit would take more than this of its CURRENT hp
+SWITCH_MARGIN = 0.15       # switch-in must beat staying put by this much
+SWITCH_COOLDOWN = 3        # after any switch-in, no voluntary switching for the next 2 turns
+HEAL_HP_THRESHOLD = 0.35   # gym leader uses a Hyper Potion at/below this HP fraction
 SWITCH_KILL_THRESHOLD = 0.45     # a candidate's best move must clear at least this much of the foe's max
                                   # HP to count as a real "can kill it back" threat - not just chip damage
 
@@ -164,6 +172,34 @@ def _survives_trade(attacker: BattlePokemon, defender: BattlePokemon, atk_move: 
     return turns_opp_needs > hits_taken
 
 
+def _is_faster(a: BattlePokemon, b: BattlePokemon) -> bool:
+    sa, sb = a.effective_stat("spe"), b.effective_stat("spe")
+    return sa > sb or (sa == sb and a.base_speed > b.base_speed)
+
+
+def pick_best_replacement(trainer: Trainer, opponent: Trainer) -> int:
+    """Best bench index to send in after a faint (or as the lead): rewards
+    offense vs the foe, OHKO threat and speed; penalises taking a big hit;
+    prefers healthier mons. Replaces the old 'first alive mon' behaviour."""
+    foe = opponent.active
+    best_i, best_score = None, -math.inf
+    for i, p in enumerate(trainer.team):
+        if p.fainted:
+            continue
+        offense = _best_matchup_fraction(p, foe)
+        incoming = min(_worst_case_fraction(foe, p), 1.5)
+        faster = _is_faster(p, foe)
+        score = offense * 1.5 - incoming + (0.35 if faster else 0.0)
+        if foe.hp > 0 and offense >= foe.hp / max(foe.max_hp, 1):
+            score += 1.0                       # can KO the foe outright
+        if incoming >= 1.0 and not faster:
+            score -= 1.0                       # gets killed before it moves
+        score += 0.3 * (p.hp / max(p.max_hp, 1))
+        if score > best_score:
+            best_i, best_score = i, score
+    return best_i if best_i is not None else 0
+
+
 def bot_choose_action(trainer: Trainer, opponent: Trainer) -> tuple:
     """Battle AI for the bot's own trainer.
 
@@ -218,6 +254,10 @@ def bot_choose_action(trainer: Trainer, opponent: Trainer) -> tuple:
     if active.must_recharge:
         return ("recharge", None)
 
+    if trainer.switch_cooldown > 0:
+        trainer.switch_cooldown -= 1
+    predicted_def_move = None
+
     available = [i for i, m in enumerate(moves) if m.get("current_pp", 1) > 0]
     if not available:
         best_idx, best_frac = -1, 0.0
@@ -239,6 +279,14 @@ def bot_choose_action(trainer: Trainer, opponent: Trainer) -> tuple:
             pool = racing_lethal or lethal
             return ("move", max(pool, key=lambda i: scores[i]))
 
+        # Gym leaders can heal: Hyper Potion (+50% max HP) when low, but only
+        # if it actually out-heals the foe's best hit and the mon is worth saving.
+        if trainer.heals_left > 0 and active.hp / max(active.max_hp, 1) <= HEAL_HP_THRESHOLD:
+            healed_hp = min(active.max_hp, active.hp + active.max_hp // 2)
+            raw_threat = _worst_case_fraction(defender, active) * active.hp
+            if raw_threat < healed_hp and (best_frac >= 0.3 or len(trainer.alive_team) == 1):
+                return ("heal", None)
+
         # Not lethal this turn - check whether our current pick actually
         # wins the war of attrition against the foe's predicted move. If
         # it doesn't (we're slower and would faint before finishing the
@@ -257,47 +305,42 @@ def bot_choose_action(trainer: Trainer, opponent: Trainer) -> tuple:
                     best_frac = scores[best_idx] / max(defender.max_hp, 1)
 
     bench = [(i, p) for i, p in enumerate(trainer.team) if not p.fainted and p is not active]
-    if not bench:
+    if not bench or trainer.switch_cooldown > 0 or not available:
         return ("move", best_idx)
 
-    # How hard the foe's best available option would hit US if we stay in
-    # (fraction of our current HP) - this, not just "is my best move weak",
-    # is what actually makes a matchup dangerous enough to consider bailing.
     incoming_frac = _worst_case_fraction(defender, active)
+
+    # If we win the trade by staying in (and aren't about to be one-shot), stay.
+    if predicted_def_move is not None and incoming_frac < 1.0:
+        if _survives_trade(active, defender, moves[best_idx], predicted_def_move,
+                           _acts_first(active, defender, moves[best_idx], predicted_def_move)):
+            return ("move", best_idx)
+
     matchup_is_bad = best_frac < SWITCH_HP_THRESHOLD or incoming_frac >= SWITCH_INCOMING_THRESHOLD
     if not matchup_is_bad:
         return ("move", best_idx)
 
-    def_speed = defender.effective_stat("spe")
+    stay_score = best_frac - incoming_frac * 0.5
     best_switch_idx, best_switch_score = None, 0.0
     for i, candidate in bench:
-        # Damage the candidate could take from the foe's single hardest
-        # known move, as a fraction of the candidate's CURRENT hp (a
-        # bench mon that already took damage earlier is judged on what it
-        # actually has left, not a fresh max-HP assumption).
-        cand_incoming = _worst_case_fraction(defender, candidate)
-        cand_best_frac = _best_matchup_fraction(candidate, defender)
-        cand_faster = (candidate.effective_stat("spe") > def_speed or
-                       (candidate.effective_stat("spe") == def_speed
-                        and candidate.base_speed > defender.base_speed))
-        survives_worst_hit = cand_incoming < 1.0
-        can_kill_back = cand_best_frac >= SWITCH_KILL_THRESHOLD
-
-        eligible = can_kill_back and (survives_worst_hit or cand_faster)
-        if not eligible:
+        # Switching costs a turn: the switch-in eats the foe's hit for free,
+        # so it must be healthy, survive that hit comfortably, and punish back.
+        if candidate.hp / max(candidate.max_hp, 1) < SWITCH_MIN_HP:
             continue
-
-        # Reward real offensive threat, penalize how hard it'd still get
-        # hit back, and give a small bonus to speed since a faster mon
-        # gets to land its hit before the foe can retaliate at all.
+        cand_incoming = _worst_case_fraction(defender, candidate)
+        if cand_incoming > SWITCH_MAX_INCOMING:
+            continue
+        cand_best_frac = _best_matchup_fraction(candidate, defender)
+        if cand_best_frac < SWITCH_KILL_THRESHOLD:
+            continue
+        cand_faster = _is_faster(candidate, defender)
         score = cand_best_frac - cand_incoming * 0.5 + (0.1 if cand_faster else 0.0)
-        if score > best_switch_score:
-            best_switch_score = score
-            best_switch_idx = i
+        if score > stay_score + SWITCH_MARGIN and score > best_switch_score:
+            best_switch_score, best_switch_idx = score, i
 
     if best_switch_idx is not None:
+        trainer.switch_cooldown = SWITCH_COOLDOWN
         return ("switch", best_switch_idx)
-
     return ("move", best_idx)
 
 
