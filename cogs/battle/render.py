@@ -7,6 +7,7 @@ battle intro, text banners) that replace crowded text messages.
 """
 
 import io
+import logging
 import random
 import re
 from typing import Optional, Sequence, Tuple, TYPE_CHECKING
@@ -55,6 +56,8 @@ def pick_background() -> dict:
     preset["seed"] = random.randint(0, 1_000_000_000)
     return preset
 
+
+_log = logging.getLogger(__name__)
 
 _FONT_CACHE: dict = {}
 
@@ -401,11 +404,41 @@ async def fetch_trainer_sprite(session: aiohttp.ClientSession, name: str):
     if not PIL_OK:
         return None
     slug = _trainer_slug(name)
-    if slug in _TRAINER_SPRITE_CACHE:
+    if not slug:
+        return None
+    if _TRAINER_SPRITE_CACHE.get(slug) is not None:
         return _TRAINER_SPRITE_CACHE[slug]
-    img = await _fetch_sprite(session, TRAINER_SPRITE_URL.format(slug=slug))
-    _TRAINER_SPRITE_CACHE[slug] = img
+    url = TRAINER_SPRITE_URL.format(slug=slug)
+    img = await _fetch_sprite(session, url)
+    if img is None:
+        _log.warning("Trainer sprite not found: %r -> %s", name, url)
+    else:
+        _TRAINER_SPRITE_CACHE[slug] = img  # only cache successes
     return img
+
+
+_GENERIC_WORDS = re.compile(r"\b(gym|leader|elite|four|champion|the|trainer|of|city|town)\b", re.I)
+
+
+def _name_candidates(*names: str) -> list:
+    """Extra lookup names from titles like 'Pewter City Gym Leader Brock':
+    the raw name, then the name with generic words removed, then each
+    remaining word on its own (so 'Brock' is found inside a long title)."""
+    out = []
+    for n in names:
+        if not n:
+            continue
+        out.append(n)
+        stripped = _GENERIC_WORDS.sub(" ", n).strip()
+        if stripped and stripped != n:
+            out.append(stripped)
+            out.extend(stripped.split())
+    seen, uniq = set(), []
+    for c in out:
+        if c.lower() not in seen:
+            seen.add(c.lower())
+            uniq.append(c)
+    return uniq
 
 
 def _wrap_text(draw, text: str, font, max_w: int) -> list:
@@ -458,7 +491,8 @@ async def render_quote_card(session: aiohttp.ClientSession,
                             accent_type: Optional[str] = None,
                             chips: Sequence[Tuple[str, Tuple[int, ...]]] = (),
                             background: Optional[dict] = None,
-                            filename: str = "quote.png") -> Optional[discord.File]:
+                            filename: str = "quote.png",
+                            sprite_names: Sequence[str] = ()) -> Optional[discord.File]:
     """Image card: trainer sprite on the left, speech bubble with the quote on
     the right, name plate underneath, and an optional row of info chips
     (difficulty, shiny, weather, ...) along the bottom.
@@ -492,7 +526,11 @@ async def render_quote_card(session: aiohttp.ClientSession,
     draw.rounded_rectangle([3, 3, W - 4, H - 4], radius=16, outline=accent + (255,), width=4)
 
     # Trainer sprite (scaled up, bottom-left) or fallback badge.
-    sprite = await fetch_trainer_sprite(session, speaker)
+    sprite = None
+    for cand in _name_candidates(*sprite_names, speaker):
+        sprite = await fetch_trainer_sprite(session, cand)
+        if sprite is not None:
+            break
     sprite_cx, sprite_base = 95, H - (chips_h + 40 if chips else 52)
     if sprite:
         scale = max(1, min(3, (H - 90) // max(sprite.height, 1)))
