@@ -283,9 +283,10 @@ class Battle:
     async def get_forced_switch(self, trainer: Trainer) -> int:
         if trainer.is_bot:
             # No UI to show — just send out its next healthy Pokemon.
-            for i, p in enumerate(trainer.team):
-                if not p.fainted:
-                    return i
+            from .trainer_ai import pick_best_replacement
+            other = self.t2 if trainer is self.t1 else self.t1
+            trainer.switch_cooldown = 3
+            return pick_best_replacement(trainer, other)
         future = asyncio.get_event_loop().create_future()
         view = ForcedSwitchView(trainer, future)
         await self.channel.send(
@@ -407,6 +408,15 @@ class Battle:
                         f"**{trainer.active.name.title()}**!"
                     )
                     lines.extend(self._apply_switch_in_abilities(trainer, opponent))
+                elif action and action[0] == "heal":
+                    mon = trainer.active
+                    before = mon.hp
+                    mon.hp = min(mon.max_hp, mon.hp + mon.max_hp // 2)
+                    trainer.heals_left -= 1
+                    lines.append(
+                        f"🧪 {trainer.user.display_name} used a **Hyper Potion** on "
+                        f"{mon.name.title()}! (+{mon.hp - before} HP, {trainer.heals_left} left)"
+                    )
                 elif action and action[0] == "pass":
                     lines.append(f"⏭️ {trainer.user.display_name} passed the turn.")
                 elif action and action[0] == "recharge":
