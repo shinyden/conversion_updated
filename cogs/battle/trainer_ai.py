@@ -27,6 +27,8 @@ class Trainer:
     title: str = ""           # display name for flavor lines (e.g. "Fire Gym Leader")
     quotes: dict = field(default_factory=dict)  # intro / ace / heal / win / lose
     ace_announced: bool = False
+    sprite_name: str = ""     # gym leader's name for the quote-card sprite lookup (e.g. "Brock")
+    accent_type: str = ""     # gym leader's type (e.g. "rock") — colours the quote card
 
     @property
     def active(self) -> BattlePokemon:
