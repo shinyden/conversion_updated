@@ -35,6 +35,8 @@ async def main():
     await db.ensure_indexes()              # create query indexes (idempotent)
     async with bot:
         await bot.load_extension("cogs.help_cog")
+        await bot.load_extension("cogs.event_helper_cog")
+        await bot.load_extension("cogs.emoji_extractor")
         await bot.load_extension("cogs.repeat_cog")
         await bot.load_extension("cogs.admin_cog")
         await bot.load_extension("cogs.gym_cog")
