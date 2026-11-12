@@ -50,7 +50,7 @@ from discord.ext import commands
 from .battle.constants import LEVEL, GYM_TYPES, GYM_TYPE_EMOJI, GYM_BADGE_NAME, GYM_TOTAL_BADGES
 from .battle.pokeapi import get_pokemon_data, pick_moves, build_gym_team
 from .battle.engine import BattlePokemon
-from .battle.trainer_ai import Trainer
+from .battle.trainer_ai import Trainer, pick_best_replacement
 from .battle.runner import Battle
 
 import db as _db
@@ -214,8 +214,26 @@ class GymCog(commands.Cog, name="Gym"):
         )
         ai_team = await build_gym_team(self.session, pending.gym_type, pending.team, pending.count)
 
+        # Gym leaders are trained: +10% stats, and their ace (last mon) gets +20%.
+        for n, mon in enumerate(ai_team):
+            boost = 1.20 if (n == len(ai_team) - 1 and len(ai_team) > 1) else 1.10
+            for stat in ("atk", "dfn", "spa", "spd", "spe"):
+                setattr(mon, stat, int(getattr(mon, stat) * boost))
+            mon.max_hp = int(mon.max_hp * boost)
+            mon.hp = mon.max_hp
+
         t1 = Trainer(pending.trainer, team=pending.team)
-        t2 = Trainer(self.bot.user, team=ai_team, is_bot=True)
+        t2 = Trainer(self.bot.user, team=ai_team, is_bot=True, hard=True,
+                     heals_left=2 if pending.count >= 3 else 1)
+
+        # Smart lead: best matchup vs the player's lead (the ace stays last).
+        if len(ai_team) > 2:
+            body = ai_team[:-1]
+            t2.team = body
+            lead = pick_best_replacement(t2, t1)
+            body.insert(0, body.pop(lead))
+            t2.team = body + [ai_team[-1]]
+        ai_team = t2.team
 
         battle = Battle(battle_cog, ctx.channel, t1, t2, fmt="random",
                          count=pending.count, vs_bot=True)
@@ -223,7 +241,9 @@ class GymCog(commands.Cog, name="Gym"):
         await ctx.send(
             f"⚔️ **Gym battle start!** {pending.trainer.mention} vs the "
             f"{emoji} **{pending.gym_type.title()} Gym** — Level {LEVEL}, "
-            f"{pending.count} Pokémon each."
+            f"{pending.count} Pokémon each.\n"
+            f"💪 Gym leader Pokémon are trained (+10% stats, ace +20%) and carry "
+            f"**{t2.heals_left} Hyper Potion(s)**."
         )
         await battle.run()
 
