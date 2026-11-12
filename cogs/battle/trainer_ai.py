@@ -24,6 +24,9 @@ class Trainer:
     heals_left: int = 0       # Hyper Potions the AI can still use (gym leaders)
     switch_cooldown: int = 0  # AI can't voluntarily switch while > 0 (stops ping-pong switching)
     hard: bool = False        # gym-leader mode
+    title: str = ""           # display name for flavor lines (e.g. "Fire Gym Leader")
+    quotes: dict = field(default_factory=dict)  # intro / ace / heal / win / lose
+    ace_announced: bool = False
 
     @property
     def active(self) -> BattlePokemon:
@@ -50,7 +53,8 @@ def estimate_damage(attacker: BattlePokemon, defender: BattlePokemon, move: dict
     if eff == 0:
         return 0.0
     base = (((2 * LEVEL / 5 + 2) * power * a / max(d, 1)) / 50 + 2)
-    return base * stab * eff
+    item_mult = 1.3 if attacker.item == "life-orb" else (1.2 if attacker.item == "expert-belt" and eff > 1 else 1.0)
+    return base * stab * eff * item_mult
 
 
 SWITCH_HP_THRESHOLD = 0.25       # consider switching if best move clears less than this % of foe's HP
