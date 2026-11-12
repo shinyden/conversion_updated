@@ -461,7 +461,8 @@ async def build_team(session: aiohttp.ClientSession, count: int,
 # counters to the challenger's team, then leans each one's moveset toward
 # hitting that specific team hard instead of just whatever's highest-power.
 
-GYM_TYPE_POOL_ATTEMPTS = 40  # species of the gym's type actually fetched/considered per challenge
+GYM_TYPE_POOL_ATTEMPTS = 60  # species of the gym's type actually fetched/considered per challenge
+GYM_MIN_BST = 450  # gym leaders won't field species below this base stat total (unless the pool is too thin)
 
 
 async def get_pokemon_of_type(session: aiohttp.ClientSession, type_name: str) -> list:
@@ -498,9 +499,15 @@ def _counter_score(candidate_types: list, candidate_stats: dict, opponent_team: 
     for opp in opponent_team:
         best_hit = max((type_multiplier(t, opp.types) for t in candidate_types), default=1.0)
         worst_taken = max((type_multiplier(ot, candidate_types) for ot in opp.types), default=1.0)
-        total += best_hit - worst_taken
+        # Clamp each matchup so one lopsided secondary typing (e.g. Lotad's
+        # Water half vs a Fire team) can't dwarf everything else.
+        total += max(-2.0, min(2.0, best_hit - worst_taken))
+    avg_edge = total / max(len(opponent_team), 1)
     bst = sum(candidate_stats.values()) if candidate_stats else 0
-    return total * 100 + bst / 10
+    # BST now dominates (raw value, ~200-720) and typing is a bounded
+    # +/-~80 nudge on top. Previously typing was x100 per matchup vs
+    # BST/10, so a 220-BST Lotad beat a 520-BST Ogerpon on type alone.
+    return bst + avg_edge * 40
 
 
 async def pick_gym_moves(session: aiohttp.ClientSession, data: dict,
@@ -587,6 +594,18 @@ async def _best_gym_counters(session: aiohttp.ClientSession, gym_type: str,
             if len(candidates) >= count:
                 break
 
+    # Gym leaders shouldn't field Lotad-tier Pokemon: drop anything under the
+    # BST floor, but only if enough real candidates remain to fill the team.
+    strong = [d for d in candidates if sum((d.get("stats") or {}).values()) >= GYM_MIN_BST]
+    if len(strong) >= count:
+        candidates = strong
+    else:
+        # Not enough strong ones in the sampled pool: keep the strong ones
+        # and top up with the highest-BST remainder instead of the weakest.
+        rest = sorted((d for d in candidates if d not in strong),
+                      key=lambda d: sum((d.get("stats") or {}).values()), reverse=True)
+        candidates = strong + rest
+
     candidates.sort(
         key=lambda d: _counter_score(d.get("types", []), d.get("stats", {}), opponent_team),
         reverse=True,
@@ -608,3 +627,25 @@ async def build_gym_team(session: aiohttp.ClientSession, gym_type: str,
         *[pick_gym_moves(session, data, opponent_team) for data in chosen_data]
     )
     return [BattlePokemon(data, moves) for data, moves in zip(chosen_data, teams)]
+
+
+async def retune_moves_against(session: aiohttp.ClientSession,
+                                team: list, opponent_team: list) -> None:
+    """Re-picks every Pokemon in `team`'s moveset to hit `opponent_team`
+    hard, in place. Used for the challenger once the gym leader's team is
+    known (the gym team is built from the challenger's team, so the
+    challenger's moves can only be tuned afterwards). Reuses
+    pick_gym_moves(), so priority moves are protected from the swap and
+    STAB/status picks are only displaced by clearly better coverage."""
+    async def _retune(mon: BattlePokemon):
+        data = await get_pokemon_data(session, mon.name)
+        if not data or not data.get("move_pool"):
+            return  # keep the existing moves rather than risk an empty set
+        moves = await pick_gym_moves(session, data, opponent_team)
+        if not moves:
+            return
+        for mv in moves:
+            mv.setdefault("current_pp", mv.get("pp") or 5)
+        mon.moves = moves
+
+    await asyncio.gather(*[_retune(m) for m in team], return_exceptions=True)
