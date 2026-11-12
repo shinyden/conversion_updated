@@ -79,6 +79,41 @@ def _font(size: int, bold: bool = True):
     return f
 
 
+def _mix(c1, c2, t):
+    return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3)) + (255,)
+
+
+def _draw_sparkle(draw, x, y, s, fill):
+    k = s * 0.3
+    draw.polygon([(x, y - s), (x + k, y - k), (x + s, y), (x + k, y + k),
+                  (x, y + s), (x - k, y + k), (x - s, y), (x - k, y - k)], fill=fill)
+
+
+def _draw_scene_base(draw, bg, seed):
+    """Gradient sky, soft clouds (day) and a gradient ground with a horizon line."""
+    horizon = CANVAS_H - 120
+    top = _mix(bg["sky"], (0, 0, 0), 0.18)
+    bottom = _mix(bg["sky"], (255, 255, 255) if bg["time"] == "day" else (70, 90, 150), 0.28)
+    for y in range(horizon):
+        draw.line([(0, y), (CANVAS_W, y)], fill=_mix(top, bottom, y / max(horizon, 1)))
+    if bg["time"] == "day":
+        rng = random.Random(seed + 7)
+        for _ in range(4):
+            cx, cy = rng.randint(40, CANVAS_W - 80), rng.randint(20, 110)
+            for dx, dy, r in ((0, 0, 18), (20, 4, 14), (-20, 5, 13), (8, -8, 12)):
+                draw.ellipse([cx + dx - r, cy + dy - r // 2, cx + dx + r, cy + dy + r // 2],
+                             fill=(255, 255, 255, 210))
+
+
+def _draw_ground(draw, bg):
+    horizon = CANVAS_H - 120
+    far = _mix(bg["ground"], (255, 255, 255), 0.08)
+    near = _mix(bg["ground"], (0, 0, 0), 0.18)
+    for y in range(horizon, CANVAS_H):
+        draw.line([(0, y), (CANVAS_W, y)], fill=_mix(far, near, (y - horizon) / 120))
+    draw.line([(0, horizon), (CANVAS_W, horizon)], fill=_mix(bg["ground"], (0, 0, 0), 0.35), width=2)
+
+
 def _hp_color(frac: float):
     if frac > 0.5:
         return (60, 200, 70, 255)
@@ -102,7 +137,7 @@ async def _fetch_sprite(session: aiohttp.ClientSession, url: str):
 
 def _draw_hp_bar_above(draw: "ImageDraw.ImageDraw", center_x: float, sprite_top_y: float,
                         name: str, hp: int, max_hp: int, stat_stages: Optional[dict] = None,
-                        status: Optional[str] = None, width: int = 190):
+                        status: Optional[str] = None, width: int = 190, shiny: bool = False):
     """Draws a compact name+HP-bar plate directly above a sprite's position.
     If `stat_stages` has any non-zero entries, a row of small chips is added
     below the HP bar showing each affected stat's current multiplier —
@@ -115,14 +150,15 @@ def _draw_hp_bar_above(draw: "ImageDraw.ImageDraw", center_x: float, sprite_top_
     bar_h = 10
     chip_h = 15
     active_stages = sorted((k, v) for k, v in (stat_stages or {}).items() if v)
-    plate_h = 40 + (chip_h + 5 if active_stages else 0)
+    plate_h = 54 + (chip_h + 5 if active_stages else 0)
     x = int(center_x - width / 2)
     x = max(6, min(x, CANVAS_W - width - 6))
     y = int(max(4, sprite_top_y - plate_h - 6))
 
     draw.rounded_rectangle([x, y, x + width, y + plate_h], radius=9,
-                            fill=(255, 255, 255, 235), outline=(40, 40, 40, 255), width=2)
-    draw.text((x + 10, y + 4), f"{name.title()}  Lv.{LEVEL}",
+                            fill=(255, 255, 255, 235),
+                            outline=((230, 170, 20, 255) if shiny else (40, 40, 40, 255)), width=3 if shiny else 2)
+    draw.text((x + 10, y + 4), f"{'★ ' if shiny else ''}{name.title()}  Lv.{LEVEL}",
                font=_font(14), fill=(20, 20, 20, 255))
 
     if status:
@@ -145,9 +181,14 @@ def _draw_hp_bar_above(draw: "ImageDraw.ImageDraw", center_x: float, sprite_top_
         draw.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h],
                                 radius=5, fill=_hp_color(frac))
 
+    hp_txt = f"HP {max(hp, 0)}/{max_hp}"
+    tb = draw.textbbox((0, 0), hp_txt, font=_font(11, bold=False))
+    draw.text((x + width - 10 - (tb[2] - tb[0]), bar_y + bar_h + 3), hp_txt,
+               font=_font(11, bold=False), fill=(60, 60, 60, 255))
+
     if not active_stages:
         return
-    chip_y = bar_y + bar_h + 5
+    chip_y = bar_y + bar_h + 20
     cx = bar_x
     right_edge = x + width - 6
     for key, stage in active_stages:
@@ -222,8 +263,9 @@ async def render_battle_scene(session: aiohttp.ClientSession,
 
     canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), bg["sky"])
     draw = ImageDraw.Draw(canvas)
+    _draw_scene_base(draw, bg, seed=bg.get("seed", 0))
     _draw_background_flair(draw, bg, seed=bg.get("seed", 0))
-    draw.rectangle([0, CANVAS_H - 120, CANVAS_W, CANVAS_H], fill=bg["ground"])
+    _draw_ground(draw, bg)
     draw.ellipse([CANVAS_W * 0.55 - 150, CANVAS_H - 150, CANVAS_W * 0.55 + 150, CANVAS_H - 90],
                  fill=bg["patch"])
     draw.ellipse([CANVAS_W * 0.14 - 120, CANVAS_H - 95, CANVAS_W * 0.14 + 120, CANVAS_H - 45],
@@ -235,27 +277,52 @@ async def render_battle_scene(session: aiohttp.ClientSession,
     opp_pos = (int(CANVAS_W * 0.60), 68)
     player_pos = (int(CANVAS_W * 0.06), CANVAS_H - 232)
 
-    opp_w = 96 * SPRITE_SCALE
     if opp_sprite:
         opp_sprite = opp_sprite.resize(
             (opp_sprite.width * SPRITE_SCALE, opp_sprite.height * SPRITE_SCALE), Image.NEAREST)
-        canvas.alpha_composite(opp_sprite, opp_pos)
-        opp_w = opp_sprite.width
-
-    player_w = 96 * SPRITE_SCALE
     if player_sprite:
         player_sprite = ImageOps.mirror(player_sprite)
         player_sprite = player_sprite.resize(
             (player_sprite.width * SPRITE_SCALE, player_sprite.height * SPRITE_SCALE), Image.NEAREST)
+    opp_w = opp_sprite.width if opp_sprite else 96 * SPRITE_SCALE
+    opp_h = opp_sprite.height if opp_sprite else 96 * SPRITE_SCALE
+    player_w = player_sprite.width if player_sprite else 96 * SPRITE_SCALE
+    player_h = player_sprite.height if player_sprite else 96 * SPRITE_SCALE
+
+    # Soft drop-shadow ellipses under each Pokemon so they sit on the ground.
+    shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow)
+    for (px, py), w, h in ((opp_pos, opp_w, opp_h), (player_pos, player_w, player_h)):
+        cx, cy = px + w / 2, py + h - 14
+        sd.ellipse([cx - w * 0.38, cy - 12, cx + w * 0.38, cy + 14], fill=(0, 0, 0, 80))
+        sd.ellipse([cx - w * 0.26, cy - 7, cx + w * 0.26, cy + 9], fill=(0, 0, 0, 60))
+    canvas = Image.alpha_composite(canvas, shadow)
+    draw = ImageDraw.Draw(canvas)
+
+    if opp_sprite:
+        canvas.alpha_composite(opp_sprite, opp_pos)
+    if player_sprite:
         canvas.alpha_composite(player_sprite, player_pos)
-        player_w = player_sprite.width
+
+    # Shiny sparkles around any shiny Pokemon.
+    srng = random.Random(bg.get("seed", 0) + 99)
+    for mon, (px, py), w, h in ((opponent_pokemon, opp_pos, opp_w, opp_h),
+                                (player_pokemon, player_pos, player_w, player_h)):
+        if getattr(mon, "shiny", False):
+            for _ in range(7):
+                sx = px + srng.randint(0, int(w))
+                sy = py + srng.randint(0, int(h))
+                _draw_sparkle(draw, sx, sy, srng.choice((5, 7, 9)),
+                              srng.choice(((255, 235, 120, 255), (255, 255, 255, 255))))
 
     _draw_hp_bar_above(draw, opp_pos[0] + opp_w / 2, opp_pos[1],
                         opponent_pokemon.name, opponent_pokemon.hp, opponent_pokemon.max_hp,
-                        stat_stages=opponent_pokemon.stat_stages, status=opponent_pokemon.status)
+                        stat_stages=opponent_pokemon.stat_stages, status=opponent_pokemon.status,
+                        shiny=getattr(opponent_pokemon, 'shiny', False))
     _draw_hp_bar_above(draw, player_pos[0] + player_w / 2, player_pos[1],
                         player_pokemon.name, player_pokemon.hp, player_pokemon.max_hp,
-                        stat_stages=player_pokemon.stat_stages, status=player_pokemon.status)
+                        stat_stages=player_pokemon.stat_stages, status=player_pokemon.status,
+                        shiny=getattr(player_pokemon, 'shiny', False))
 
     buf = io.BytesIO()
     canvas.convert("RGB").save(buf, format="PNG")
