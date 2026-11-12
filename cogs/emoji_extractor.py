@@ -447,4 +447,19 @@ class EmojiExtractorCog(commands.Cog, name="Emoji Extractor"):
             size = 0
             for line in lines:
                 if size + len(line) + 1 > 1800:
-                    await interaction.followup.send(f"```python\
+                    await interaction.followup.send(f"```python\n" + "\n".join(chunk) + "\n```", ephemeral=ephemeral)
+                    chunk, size = [], 0
+                chunk.append(line)
+                size += len(line) + 1
+            if chunk:
+                await interaction.followup.send(f"```python\n" + "\n".join(chunk) + "\n```", ephemeral=ephemeral)
+
+    async def cog_command_error(self, ctx: commands.Context, error: commands.CommandError):
+        if isinstance(error, commands.MessageNotFound):
+            await ctx.reply("❌ I couldn't find that message.", mention_author=False)
+        elif isinstance(error, commands.BadArgument):
+            await ctx.reply("❌ Give a valid message link or ID, or reply to a message.", mention_author=False)
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(EmojiExtractorCog(bot))
