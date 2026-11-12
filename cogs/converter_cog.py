@@ -1,582 +1,674 @@
-import json
+"""
+Converter cog — Components V2 / forwarded messages  →  classic embeds.
+
+Requires discord.py 2.6+ (native Components V2 + forwarded-message snapshots).
+No raw gateway parsing and no in-memory caches: everything that must survive
+between events lives in MongoDB.
+
+Collections used
+  converter_channels  {guild_id, channel_ids: [..]}        channels with auto-convert ON
+  converter_links     {_id: original_msg_id, ...}          original → converted copy (TTL)
+
+Bot permissions needed: Manage Webhooks, Send Messages, Embed Links,
+Read Message History (Manage Messages is NOT needed).
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import datetime
+import re
+from typing import Optional, Union
+from urllib.parse import urlsplit
+
 import discord
 from discord import app_commands
+from discord import components as dc
 from discord.ext import commands
-from collections import OrderedDict
 
-CACHE_MAX_SIZE = 500
+import db
 
-AUTO_CONVERT_BOT_IDS = [
-    # 000000000000000000,  # Pokétwo
-]
+try:                                    # emoji_map.py = your index of emojis to swap
+    from emoji_map import replace_emojis
+except ImportError:                     # file missing → converter still works, no swapping
+    def replace_emojis(text: str) -> str:
+        return text
 
-_converted: OrderedDict[int, bool] = OrderedDict()
-_CONVERTED_MAX = 1000
+# ── Settings ────────────────────────────────────────────────────────────────
 
-# Maps original message_id -> channel_id of the webhook reply, so we can
-# label edit conversions with a jump link back to the original.
-_edit_origin: OrderedDict[int, int] = OrderedDict()
-_EDIT_ORIGIN_MAX = 1000
+WEBHOOK_NAME = "V2 Converter Pro"
+LINK_TTL_DAYS = 14          # how long an edit/delete link to a converted copy is kept
+MIRROR_DELETES = True       # delete the converted copy when the original is deleted
+DESC_LIMIT = 4000           # embed description cap (hard limit is 4096)
+MAX_EMBEDS = 10             # Discord hard limit per message
 
+NO_MENTIONS = discord.AllowedMentions.none()
+V2_FOOTER = "Components V2 → Embed"
 
-def _store_edit_origin(message_id: int, channel_id: int):
-    if message_id not in _edit_origin:
-        if len(_edit_origin) >= _EDIT_ORIGIN_MAX:
-            _edit_origin.popitem(last=False)
-    _edit_origin[message_id] = channel_id
-
-_author_cache: OrderedDict[int, dict] = OrderedDict()
-_AUTHOR_CACHE_MAX = 2000
+ConvertibleChannel = Union[discord.TextChannel, discord.VoiceChannel, discord.ForumChannel]
 
 
-def _store_author(message_id: int, author: dict):
-    if message_id not in _author_cache:
-        if len(_author_cache) >= _AUTHOR_CACHE_MAX:
-            _author_cache.popitem(last=False)
-    _author_cache[message_id] = author
+# ── Parsing ─────────────────────────────────────────────────────────────────
+
+def _media_key(url: str) -> str:
+    """CDN urls differ only by their ?ex=&is=&hm= query — compare by path."""
+    return urlsplit(url).path
 
 
-def _get_author(message_id: int, payload_author: dict) -> dict:
-    if payload_author:
-        return payload_author
-    return _author_cache.get(message_id, {})
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".bmp")
 
 
-def _mark_converted(message_id: int):
-    if message_id not in _converted:
-        if len(_converted) >= _CONVERTED_MAX:
-            _converted.popitem(last=False)
-        _converted[message_id] = True
+def _is_image_attachment(att) -> bool:
+    """Image by content-type, falling back to the file extension (snapshots can lack a type)."""
+    if (att.content_type or "").lower().startswith("image/"):
+        return True
+    return urlsplit(att.url).path.lower().endswith(_IMAGE_EXTS)
 
 
-def _unmark_converted(message_id: int):
-    _converted.pop(message_id, None)
+class _Parsed:
+    __slots__ = ("text", "buttons", "selects", "images", "thumbnail", "color", "seen")
+
+    def __init__(self):
+        self.text: list[str] = []
+        self.buttons: list[tuple[str, Optional[str]]] = []
+        self.selects: list[tuple[str, list[str]]] = []
+        self.images: list[tuple[str, str]] = []
+        self.thumbnail: Optional[tuple[str, str]] = None
+        self.color: Optional[int] = None
+        self.seen: set[str] = set()       # media already represented (for de-duplication)
+
+    def add_image(self, url: str, desc: str = ""):
+        if not url or _media_key(url) in self.seen:      # skip duplicates of the same media
+            return
+        self.images.append((url, desc or ""))
+        self.seen.add(_media_key(url))
 
 
-def _already_converted(message_id: int) -> bool:
-    return message_id in _converted
-
-
-# Component type reference (Discord API):
-#  1  = ActionRow
-#  2  = Button
-#  3  = StringSelect
-#  9  = Section        ← has "components" (children) + optional "accessory"
-#  10 = TextDisplay
-#  11 = Thumbnail      ← has "media" + optional "description"
-#  12 = MediaGallery   ← has "items"
-#  13 = File
-#  14 = Separator
-#  17 = Container
-#  25 = Section (older name — same structure, keep both)
-
-def _walk(components: list, result: dict):
+def _walk(components, out: _Parsed):
     for comp in components:
-        ctype = comp.get("type")
+        if isinstance(comp, dc.Container):
+            if out.color is None and comp.accent_colour is not None:
+                out.color = comp.accent_colour.value
+            _walk(comp.children, out)
 
-        if ctype == 17:        # Container
-            if result["color"] is None and comp.get("accent_color") is not None:
-                result["color"] = comp["accent_color"]
-            _walk(comp.get("components", []), result)
+        elif isinstance(comp, dc.ActionRow):
+            _walk(comp.children, out)
 
-        elif ctype == 1:       # ActionRow
-            _walk(comp.get("components", []), result)
+        elif isinstance(comp, dc.SectionComponent):
+            _walk(comp.children, out)
+            if comp.accessory is not None:
+                _walk([comp.accessory], out)
 
-        elif ctype in (9, 25): # Section — children in "components", button in "accessory"
-            _walk(comp.get("components", []), result)
-            accessory = comp.get("accessory")
-            if accessory:
-                _walk([accessory], result)
+        elif isinstance(comp, dc.TextDisplay):
+            text = (comp.content or "").strip()
+            if text:
+                out.text.append(text)
 
-        elif ctype == 10:      # TextDisplay
-            content = comp.get("content", "").strip()
-            if content:
-                result["text"].append(content)
-
-        elif ctype == 11:      # Thumbnail (correct type number)
-            url = (comp.get("media") or {}).get("url", "")
-            desc = comp.get("description", "")
-            if url and result["thumbnail"] is None:
-                result["thumbnail"] = (url, desc)
-
-        elif ctype == 14:      # Separator
-            pass
-
-        elif ctype == 12:      # MediaGallery
-            for item in comp.get("items", []):
-                url = (item.get("media") or {}).get("url", "")
-                desc = item.get("description", "")
-                if url:
-                    result["images"].append((url, desc))
-
-        elif ctype == 13:      # File
-            f = comp.get("file", {})
-            url = f.get("url", "")
-            name = f.get("filename", "file")
+        elif isinstance(comp, dc.ThumbnailComponent):
+            url = comp.media.url if comp.media else ""
             if url:
-                result["text"].append(f"📎 [{name}]({url})")
+                if out.thumbnail is None:
+                    out.thumbnail = (url, comp.description or "")
+                    out.seen.add(_media_key(url))
+                else:
+                    out.add_image(url, comp.description or "")
 
-        elif ctype == 2:       # Button
-            label = comp.get("label", "")
-            url   = comp.get("url")
-            emoji = (comp.get("emoji") or {}).get("name", "")
-            display = f"{emoji} {label}".strip()
-            if display:
-                result["buttons"].append((display, url))
+        elif isinstance(comp, dc.MediaGalleryComponent):
+            for item in comp.items:
+                out.add_image(item.media.url if item.media else "", item.description or "")
 
-        elif ctype == 3:       # StringSelect
-            placeholder = comp.get("placeholder", "Select an option")
-            options     = [o.get("label", "") for o in comp.get("options", [])]
-            result["selects"].append((placeholder, options))
+        elif isinstance(comp, dc.FileComponent):
+            url = comp.media.url if comp.media else ""
+            if url:
+                out.text.append(f"📎 [{comp.name or 'file'}]({url})")
+                out.seen.add(_media_key(url))
 
+        elif isinstance(comp, dc.Button):
+            label = f"{comp.emoji} {comp.label or ''}".strip() if comp.emoji else (comp.label or "")
+            if label:
+                out.buttons.append((label, comp.url))
+
+        elif isinstance(comp, dc.SelectMenu):
+            options = [o.label for o in comp.options]
+            out.selects.append((comp.placeholder or "Select an option", options))
+
+        # SeparatorComponent and anything unknown: nothing to show
+
+
+# ── Embed building ──────────────────────────────────────────────────────────
+
+def is_forward(message: discord.Message) -> bool:
+    ref = message.reference
+    return bool(
+        ref is not None
+        and ref.type is discord.MessageReferenceType.forward
+        and message.message_snapshots
+    )
+
+
+def is_convertible_v2(message: discord.Message) -> bool:
+    """True for a V2 message, or a forward whose original was a V2 message."""
+    if message.flags.components_v2:
+        return True
+    return is_forward(message) and message.message_snapshots[0].flags.components_v2
+
+
+def build_embeds(message: discord.Message, *, author_in_embed: bool = False) -> list[discord.Embed]:
+    """Convert a message (or the snapshot inside a forward) into 0‑10 embeds."""
+    forwarded = is_forward(message)
+    src = message.message_snapshots[0] if forwarded else message
+
+    data = _Parsed()
+    _walk(src.components, data)
+
+    if src.content and src.content.strip():
+        data.text.insert(0, src.content.strip())
+
+    # classic embeds on the source (matters for manual !c on normal messages)
+    for e in src.embeds:
+        if e.type in ("image", "gifv"):
+            # preview of a direct image / GIF link: the media itself is the content
+            media = e.image or e.thumbnail
+            if media and media.url:
+                data.add_image(media.url)
+            continue
+        if e.title:
+            data.text.append(f"**{e.title}**")
+        if e.description:
+            data.text.append(e.description)
+        for f in e.fields:
+            data.text.append(f"**{f.name}**\n{f.value}")
+        if e.image and e.image.url:
+            data.add_image(e.image.url)
+        if e.thumbnail and e.thumbnail.url and data.thumbnail is None:
+            data.thumbnail = (e.thumbnail.url, "")
+        if e.color is not None and data.color is None:
+            data.color = e.color.value
+
+    # attachments — skip the ones already shown through a gallery / file component
+    for att in src.attachments:
+        if _media_key(att.url) in data.seen:
+            continue
+        if _is_image_attachment(att):
+            data.add_image(att.url, att.filename)
         else:
-            # Unknown — recurse defensively
-            _walk(comp.get("components", []), result)
-            accessory = comp.get("accessory")
-            if accessory:
-                _walk([accessory], result)
+            data.text.append(f"📎 [{att.filename}]({att.url})")
 
+    for sticker in getattr(src, "stickers", []):
+        data.text.append(f"🏷️ Sticker: **{sticker.name}**")
 
-def _parse(raw_components: list) -> dict:
-    result = {"text": [], "buttons": [], "selects": [],
-              "images": [], "thumbnail": None, "color": None}
-    _walk(raw_components, result)
-    return result
-
-
-def _build_embeds(message: discord.Message, raw_components: list) -> list[discord.Embed]:
-    data = _parse(raw_components)
-
-    if message.content and message.content.strip():
-        data["text"].insert(0, message.content.strip())
-
-    for embed in message.embeds:
-        if embed.description:
-            data["text"].append(embed.description)
-        for field in embed.fields:
-            data["text"].append(f"**{field.name}**\n{field.value}")
-        if embed.image and embed.image.url:
-            data["images"].append((embed.image.url, ""))
-        if embed.thumbnail and embed.thumbnail.url and data["thumbnail"] is None:
-            data["thumbnail"] = (embed.thumbnail.url, "")
-        if embed.color and data["color"] is None:
-            data["color"] = embed.color.value
-
-    for att in message.attachments:
-        if (att.content_type or "").startswith("image/"):
-            data["images"].append((att.url, att.filename))
-        else:
-            data["text"].append(f"📎 [{att.filename}]({att.url})")
-
-    color = discord.Color(data["color"]) if data["color"] else discord.Color.blurple()
-
-    desc_parts = list(data["text"])
-    if data["buttons"]:
-        desc_parts.append("**Buttons:** " + " · ".join(
-            f"[{l}]({u})" if u else f"`{l}`" for l, u in data["buttons"]
+    parts = list(data.text)
+    if data.buttons:
+        parts.append("**Buttons:** " + " · ".join(
+            f"[{label}]({url})" if url else f"`{label}`" for label, url in data.buttons
         ))
-    if data["selects"]:
-        for ph, opts in data["selects"]:
-            desc_parts.append(f"**{ph}:** " + (", ".join(f"`{o}`" for o in opts) or "*no options*"))
+    for placeholder, options in data.selects:
+        parts.append(f"**{placeholder}:** " + (", ".join(f"`{o}`" for o in options) or "*no options*"))
 
-    # Consider it readable if there's text OR at least one image
-    has_content = bool(desc_parts) or bool(data["images"]) or data["thumbnail"] is not None
-    description = "\n\n".join(desc_parts) if desc_parts else "*No text content.*"
-    if len(description) > 4090:
-        description = description[:4087] + "…"
+    hidden = len(data.images) - MAX_EMBEDS
+    if hidden > 0:
+        parts.append(f"-# +{hidden} more image(s) not shown (Discord allows {MAX_EMBEDS} embeds per message)")
 
-    main = discord.Embed(description=description, color=color, timestamp=message.created_at)
-    main.set_footer(text=f"#{message.channel.name}  •  Components V2 → Embed")
+    if not parts and not data.images and data.thumbnail is None:
+        return []
 
-    if data["thumbnail"]:
-        main.set_thumbnail(url=data["thumbnail"][0])
-    if data["images"]:
-        main.set_image(url=data["images"][0][0])
+    description = "\n\n".join(parts) if parts else "​"   # zero-width space: embed with image only
+    description = replace_emojis(description)        # swap emojis using emoji_map.py
+    if len(description) > DESC_LIMIT:
+        description = description[:DESC_LIMIT - 1] + "…"
+
+    color = discord.Color(data.color) if data.color is not None else discord.Color.blurple()
+    main = discord.Embed(description=description, color=color, timestamp=src.created_at)
+
+    channel_name = getattr(message.channel, "name", None)
+    bits = []
+    if forwarded:
+        bits.append("↪️ Forwarded")
+    if channel_name:
+        bits.append(f"#{channel_name}")
+    bits.append(V2_FOOTER if src.flags.components_v2 else "Message → Embed")
+    if message.edited_at:
+        bits.append("edited")
+    main.set_footer(text="  •  ".join(bits))
+
+    if author_in_embed:
+        main.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)
+    if data.thumbnail:
+        main.set_thumbnail(url=data.thumbnail[0])
+    if data.images:
+        main.set_image(url=data.images[0][0])
 
     embeds = [main]
-    for url, desc in data["images"][1:9]:
+    for url, desc in data.images[1:MAX_EMBEDS]:
         extra = discord.Embed(color=color)
         extra.set_image(url=url)
         if desc:
-            extra.description = f"*{desc}*"
+            extra.description = f"*{desc[:100]}*"
         embeds.append(extra)
-
-    return embeds if has_content else []
-
-
-async def _get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook:
-    webhooks = await channel.webhooks()
-    for wh in webhooks:
-        if wh.name == "V2 Converter Pro":
-            return wh
-    return await channel.create_webhook(name="V2 Converter Pro")
+    return embeds
 
 
-async def _send_via_webhook(message: discord.Message, embeds: list[discord.Embed], *, edited: bool = False):
-    channel = message.channel
-    content = f"✏️ *(this message was edited — [jump to original]({message.jump_url}))*" if edited else None
-
-    if isinstance(channel, discord.Thread):
-        wh = await _get_or_create_webhook(channel.parent)
-        await wh.send(
-            content=content,
-            embeds=embeds,
-            username=message.author.display_name,
-            avatar_url=message.author.display_avatar.url,
-            thread=channel,
-        )
-    elif isinstance(channel, discord.TextChannel):
-        wh = await _get_or_create_webhook(channel)
-        await wh.send(
-            content=content,
-            embeds=embeds,
-            username=message.author.display_name,
-            avatar_url=message.author.display_avatar.url,
-        )
-    else:
-        await channel.send(content=content, embeds=embeds)
+def _intro(message: discord.Message) -> str:
+    if is_forward(message):
+        return f"↪️ **Converted forward** posted by {message.author.mention} — [Jump to forward]({message.jump_url})"
+    return f"📬 **Converted** from {message.author.mention} — [Jump to original]({message.jump_url})"
 
 
-def _is_v2_message(payload: dict, components: list) -> bool:
-    has_container = any(c.get("type") == 17 for c in components)
-    flag_v2       = bool(payload.get("flags", 0) & (1 << 15))
-    return (has_container or flag_v2) and bool(components)
+def render(message: discord.Message, style: str) -> tuple[Optional[str], list[discord.Embed]]:
+    """
+    style:
+      "webhook" – auto copy posted through the webhook (looks like the author)
+      "plain"   – auto copy posted by the bot (fallback when it can't use webhooks)
+      "manual"  – reply from !c / context menu, with an intro line
+    """
+    if style == "manual":
+        return _intro(message), build_embeds(message)
+    return None, build_embeds(message, author_in_embed=(style == "plain"))
 
 
-def _summarise_components(components: list, indent: int = 0) -> str:
-    lines = []
-    pad = "  " * indent
-    for comp in components:
-        ctype = comp.get("type", "?")
-        label = comp.get("content") or comp.get("label") or comp.get("placeholder") or ""
-        if label:
-            label = f' "{label[:50]}"'
-        lines.append(f"{pad}type={ctype}{label}")
-        children = comp.get("components", [])
-        if children:
-            lines.append(_summarise_components(children, indent + 1))
-        accessory = comp.get("accessory")
-        if accessory:
-            lines.append(f"{pad}  [accessory]")
-            lines.append(_summarise_components([accessory], indent + 2))
-        for item in comp.get("items", []):
-            url = (item.get("media") or {}).get("url", "")
-            lines.append(f"{pad}  item url={url[:80]}")
-    return "\n".join(lines)
+def _safe_username(name: str) -> str:
+    # webhook names may not contain "clyde"/"discord" and must be 1-80 chars
+    name = re.sub(r"(?i)(clyde|discord)", lambda m: m.group(0)[0] + "\u200b" + m.group(0)[1:], name)
+    return name[:80] or "Unknown"
 
 
-class ConverterCog(commands.Cog):
+# ── The cog ─────────────────────────────────────────────────────────────────
+
+class ConverterCog(commands.Cog, name="Converter"):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self._cache: OrderedDict[int, list] = OrderedDict()
-        # guild_id → set of allowed channel IDs (loaded from DB on first use)
-        self._allowed_channels: dict[int, set[int]] = {}
+        # in-flight guard only: serialises create/edit of the SAME message so a quick
+        # send→edit can't produce two copies. Entries are removed as soon as they finish.
+        self._inflight: dict[int, list] = {}
+        self.ctx_menu = app_commands.ContextMenu(name="Convert to Embed", callback=self.ctx_convert)
 
-    # ── Allowed-channels helpers ──────────────────────────────────────────────
+    async def cog_load(self):
+        self.bot.tree.add_command(self.ctx_menu)
+        try:
+            d = db.get_db()
+            await d.converter_links.create_index(
+                "created_at", expireAfterSeconds=LINK_TTL_DAYS * 86400
+            )
+            await d.converter_channels.create_index("guild_id")
+        except Exception as e:                       # index problems must never block loading
+            print(f"[converter] index setup failed: {type(e).__name__}: {e}")
 
-    async def _load_allowed(self, guild_id: int) -> set[int]:
-        """Load allowed channels from DB into cache and return the set."""
-        import db
-        doc = await db.get_db().converter_channels.find_one({"guild_id": guild_id})
-        channels: set[int] = set(doc.get("channel_ids", [])) if doc else set()
-        self._allowed_channels[guild_id] = channels
-        return channels
+    async def cog_unload(self):
+        self.bot.tree.remove_command(self.ctx_menu.name, type=self.ctx_menu.type)
 
-    async def _get_allowed(self, guild_id: int) -> set[int]:
-        """Return cached allowed channels, loading from DB if not yet cached."""
-        if guild_id not in self._allowed_channels:
-            return await self._load_allowed(guild_id)
-        return self._allowed_channels[guild_id]
+    # ── tiny helpers ────────────────────────────────────────────────────────
 
-    async def _save_allowed(self, guild_id: int, channels: set[int]) -> None:
-        """Persist allowed channels to DB and update cache."""
-        import db
-        await db.get_db().converter_channels.update_one(
-            {"guild_id": guild_id},
-            {"$set": {"channel_ids": list(channels)}},
+    @contextlib.asynccontextmanager
+    async def _guard(self, message_id: int):
+        entry = self._inflight.get(message_id)
+        if entry is None:
+            entry = self._inflight[message_id] = [asyncio.Lock(), 0]
+        entry[1] += 1
+        try:
+            async with entry[0]:
+                yield
+        finally:
+            entry[1] -= 1
+            if entry[1] == 0:
+                self._inflight.pop(message_id, None)
+
+    async def _resolve_channel(self, channel_id: int):
+        ch = self.bot.get_channel(channel_id)
+        if ch is None:
+            try:
+                ch = await self.bot.fetch_channel(channel_id)
+            except discord.HTTPException:
+                return None
+        return ch
+
+    # ── DB: auto-convert channel list ───────────────────────────────────────
+
+    async def _auto_enabled(self, channel) -> bool:
+        """Is auto-convert on for this channel (or, for threads/forum posts, its parent)?"""
+        guild = getattr(channel, "guild", None)
+        if guild is None:
+            return False
+        ids = [channel.id]
+        parent_id = getattr(channel, "parent_id", None)
+        if parent_id:
+            ids.append(parent_id)
+        doc = await db.get_db().converter_channels.find_one(
+            {"guild_id": guild.id, "channel_ids": {"$in": ids}}, {"_id": 1}
+        )
+        return doc is not None
+
+    # ── DB: original → converted-copy links ─────────────────────────────────
+
+    @staticmethod
+    def _links():
+        return db.get_db().converter_links
+
+    async def _get_link(self, original_id: int) -> Optional[dict]:
+        return await self._links().find_one({"_id": original_id})
+
+    async def _save_link(self, original: discord.Message, copy_id: int, copy_channel_id: int, style: str):
+        await self._links().update_one(
+            {"_id": original.id},
+            {"$set": {
+                "copy_id": copy_id,
+                "copy_channel_id": copy_channel_id,
+                "style": style,
+                "created_at": datetime.datetime.now(datetime.timezone.utc),
+            }},
             upsert=True,
         )
-        self._allowed_channels[guild_id] = channels
 
-    async def _is_channel_allowed(self, guild_id: int, channel_id: int) -> bool:
-        """Return True if no restrictions set (allow all) or channel is in the list."""
-        allowed = await self._get_allowed(guild_id)
-        return len(allowed) == 0 or channel_id in allowed
+    async def _drop_link(self, original_id: int):
+        await self._links().delete_one({"_id": original_id})
 
-    def _store(self, message_id: int, components: list):
-        if message_id in self._cache:
-            self._cache.move_to_end(message_id)
-        else:
-            if len(self._cache) >= CACHE_MAX_SIZE:
-                self._cache.popitem(last=False)
-            self._cache[message_id] = components
+    # ── Webhook plumbing ────────────────────────────────────────────────────
 
-    def _get(self, message_id: int) -> list | None:
-        return self._cache.get(message_id)
+    async def _webhook_for(self, channel, *, create: bool):
+        """Return (webhook | None, thread | None) for the channel the message lives in."""
+        thread = channel if isinstance(channel, discord.Thread) else None
+        host = channel.parent if thread else channel
+        if host is None:
+            return None, thread
+        for wh in await host.webhooks():
+            if wh.name == WEBHOOK_NAME and wh.token:
+                return wh, thread
+        if not create:
+            return None, thread
+        return await host.create_webhook(name=WEBHOOK_NAME), thread
 
-    async def _handle_raw_event(self, event_type: str, payload: dict):
-        message_id = int(payload.get("id", 0))
-        if not message_id:
-            return
-
-        components = payload.get("components", [])
-        flags      = payload.get("flags", 0)
-        raw_author = payload.get("author", {})
-
-        if raw_author:
-            _store_author(message_id, raw_author)
-
-        author    = _get_author(message_id, raw_author)
-        author_id = int(author.get("id", 0))
-        is_bot    = author.get("bot", False)
-
-        has_container = any(c.get("type") == 17 for c in components)
-        flag_v2       = bool(flags & (1 << 15))
-        is_v2         = _is_v2_message(payload, components)
-
-        print(
-            f"\n{'='*60}\n"
-            f"[DBG] {event_type} | msg={message_id}\n"
-            f"  author_id={author_id} is_bot={is_bot} "
-            f"(in_payload={bool(raw_author)} from_cache={not bool(raw_author) and bool(author)})\n"
-            f"  flags={flags} | flag_v2(bit15)={flag_v2} | has_container(t17)={has_container} | is_v2={is_v2}\n"
-            f"  components({len(components)}): {[c.get('type') for c in components]}\n"
-            f"  already_converted={_already_converted(message_id)}"
+    async def _send_via_webhook(self, message: discord.Message, embeds: list[discord.Embed]) -> discord.WebhookMessage:
+        wh, thread = await self._webhook_for(message.channel, create=True)
+        kwargs = dict(
+            embeds=embeds,
+            username=_safe_username(message.author.display_name),
+            avatar_url=message.author.display_avatar.url,
+            allowed_mentions=NO_MENTIONS,
+            wait=True,
         )
-
-        if components:
-            tree = _summarise_components(components)
-            print(f"  component tree:\n{tree}")
-
-        if not is_v2:
-            print(f"  → SKIP: not a V2 message (flag_v2={flag_v2}, has_container={has_container})")
-            return
-
-        if components:
-            self._store(message_id, components)
-            print(f"  → cached {len(components)} top-level component(s)")
-
-        if not is_bot:
-            print(f"  → SKIP: author is not a bot (or author unknown from payload and cache)")
-            return
-
-        if AUTO_CONVERT_BOT_IDS and author_id not in AUTO_CONVERT_BOT_IDS:
-            print(f"  → SKIP: bot {author_id} not in AUTO_CONVERT_BOT_IDS={AUTO_CONVERT_BOT_IDS}")
-            return
-
-        if not components:
-            print(f"  → SKIP: components list is empty")
-            return
-
-        is_edit = event_type == "MESSAGE_UPDATE"
-
-        if _already_converted(message_id):
-            if is_edit:
-                # Allow re-conversion for edits
-                print(f"  → EDIT detected: clearing converted flag for re-conversion")
-                _unmark_converted(message_id)
-            else:
-                print(f"  → SKIP: already converted this message")
-                return
-
-        channel_id = int(payload.get("channel_id", 0))
-        channel = self.bot.get_channel(channel_id)
-        if channel is None:
-            print(f"  → SKIP: channel {channel_id} not in bot cache")
-            return
-
-        guild_id = int(payload.get("guild_id", 0))
-        if guild_id and not await self._is_channel_allowed(guild_id, channel_id):
-            print(f"  → SKIP: channel {channel_id} not in allowed list for guild {guild_id}")
-            return
-
+        if thread:
+            kwargs["thread"] = thread
         try:
-            message = await channel.fetch_message(message_id)
-        except Exception as e:
-            print(f"  → SKIP: fetch_message failed: {type(e).__name__}: {e}")
+            return await wh.send(**kwargs)
+        except discord.HTTPException as e:
+            if e.status != 400:
+                raise
+            kwargs["username"] = "Converted Message"     # name was rejected — retry once
+            return await wh.send(**kwargs)
+
+    # ── Create / edit / delete the converted copy ───────────────────────────
+
+    async def _publish(self, message: discord.Message, link: Optional[dict]):
+        """Create the copy of `message`, or update it in place if a link already exists."""
+        if link:
+            content, embeds = render(message, link["style"])
+            if not embeds:
+                return
+            await self._edit_copy(message, link, content, embeds)
             return
 
-        parsed = _parse(components)
-        print(
-            f"  parsed → text={len(parsed['text'])} buttons={len(parsed['buttons'])} "
-            f"images={len(parsed['images'])} thumbnail={parsed['thumbnail'] is not None}"
-        )
-
-        embeds = _build_embeds(message, components)
+        embeds = build_embeds(message)
         if not embeds:
-            print(f"  → SKIP: _build_embeds produced no content (no text, images, or thumbnail)")
             return
+        try:
+            sent = await self._send_via_webhook(message, embeds)
+            style = "webhook"
+        except discord.Forbidden:                        # no Manage Webhooks → post as the bot
+            _, embeds = render(message, "plain")
+            sent = await message.channel.send(embeds=embeds, allowed_mentions=NO_MENTIONS)
+            style = "plain"
+        await self._save_link(message, sent.id, sent.channel.id, style)
 
-        action = "EDITING" if is_edit else "CONVERTING"
-        print(f"  → ✅ {action}: sending {len(embeds)} embed(s) via webhook")
-        _mark_converted(message_id)
-        await _send_via_webhook(message, embeds, edited=is_edit)
+    async def _edit_copy(self, message: discord.Message, link: dict, content, embeds):
+        try:
+            if link["style"] == "webhook":
+                wh, thread = await self._webhook_for(message.channel, create=False)
+                if wh is None:
+                    raise discord.NotFound(_FakeResponse(), "webhook gone")
+                kwargs = dict(embeds=embeds, allowed_mentions=NO_MENTIONS)
+                if thread:
+                    kwargs["thread"] = thread
+                await wh.edit_message(link["copy_id"], **kwargs)
+            else:
+                ch = self.bot.get_channel(link["copy_channel_id"]) \
+                    or self.bot.get_partial_messageable(link["copy_channel_id"])
+                await ch.get_partial_message(link["copy_id"]).edit(
+                    content=content, embeds=embeds, allowed_mentions=NO_MENTIONS
+                )
+        except (discord.NotFound, discord.Forbidden):
+            # The copy was deleted by someone — stop tracking it instead of re-posting.
+            await self._drop_link(message.id)
+
+    async def _delete_copy(self, link: dict, channel):
+        try:
+            if link["style"] == "webhook":
+                wh, thread = await self._webhook_for(channel, create=False)
+                if wh is None:
+                    return
+                kwargs = {"thread": thread} if thread else {}
+                await wh.delete_message(link["copy_id"], **kwargs)
+            else:
+                ch = self.bot.get_channel(link["copy_channel_id"]) \
+                    or self.bot.get_partial_messageable(link["copy_channel_id"])
+                await ch.get_partial_message(link["copy_id"]).delete()
+        except discord.HTTPException:
+            pass
+
+    # ── Auto-conversion listeners ───────────────────────────────────────────
 
     @commands.Cog.listener()
-    async def on_socket_raw_receive(self, raw: str | bytes):
-        try:
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8")
-            data = json.loads(raw)
-            if data.get("op") != 0:
+    async def on_message(self, message: discord.Message):
+        if message.guild is None or message.author.id == self.bot.user.id:
+            return
+        if not is_convertible_v2(message):          # cheap flag check — no DB hit for normal chat
+            return
+        if not await self._auto_enabled(message.channel):
+            return
+        async with self._guard(message.id):
+            await self._publish(message, await self._get_link(message.id))
+
+    @commands.Cog.listener()
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
+        async with self._guard(payload.message_id):
+            link = await self._get_link(payload.message_id)
+            channel = await self._resolve_channel(payload.channel_id)
+            if channel is None:
                 return
 
-            event_type = data.get("t")
-            if event_type not in ("MESSAGE_CREATE", "MESSAGE_UPDATE"):
+            if link is None:
+                # Not converted yet. Typical case: a bot posts "thinking…" and later edits
+                # it into a V2 message, so the first time we see V2 is in an edit.
+                if not (payload.data.get("flags", 0) & (1 << 15)):
+                    return
+                if not await self._auto_enabled(channel):
+                    return
+
+            try:
+                message = await channel.fetch_message(payload.message_id)
+            except discord.HTTPException:
                 return
+            if link is None and message.author.id == self.bot.user.id:
+                return
+            await self._publish(message, link)
 
-            payload = data.get("d", {})
-            await self._handle_raw_event(event_type, payload)
+    @commands.Cog.listener()
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
+        if not MIRROR_DELETES:
+            return
+        link = await self._get_link(payload.message_id)
+        if link is None:
+            return
+        await self._drop_link(payload.message_id)
+        channel = await self._resolve_channel(payload.channel_id)
+        if channel is not None:
+            await self._delete_copy(link, channel)
 
-        except Exception as e:
-            print(f"[AUTO-CONVERT ERROR] {type(e).__name__}: {e}")
-
-    # ── Manual !convert command ───────────────────────────────────────────────
-
-    async def _do_convert(self, target: discord.Message) -> tuple[str, list[discord.Embed]]:
-        raw = self._get(target.id)
-        note = "-# ✅ Source: Components V2 (live cache)" if raw else \
-               "-# ⚠️ Not in cache — message may have been sent before bot started."
-        embeds = _build_embeds(target, raw or [])
-        intro  = (
-            f"📬 **Converted** from {target.author.mention} — "
-            f"[Jump to original]({target.jump_url})\n{note}"
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
+        await db.get_db().converter_channels.update_one(
+            {"guild_id": channel.guild.id}, {"$pull": {"channel_ids": channel.id}}
         )
-        return intro, embeds
 
-    @commands.command(name="convert", aliases=["c"], help="Reply to a Components V2 message to convert it.")
-    async def prefix_convert(self, ctx: commands.Context):
-        if ctx.message.reference is None:
-            await ctx.reply("❌ Please **reply** to the message you want to convert.")
-            return
-        try:
-            ref    = ctx.message.reference
-            target = ref.resolved or await ctx.channel.fetch_message(ref.message_id)
-        except discord.NotFound:
-            await ctx.reply("❌ Could not fetch that message.")
-            return
-        try:
-            intro, embeds = await self._do_convert(target)
-            await ctx.reply(content=intro, embeds=embeds)
-        except Exception as e:
-            await ctx.reply(f"❌ Error:\n```\n{type(e).__name__}: {e}\n```")
+    # ── Manual conversion: reply + !c / !convert, or !c <message link/id> ───
 
-    @app_commands.command(name="convert", description="Convert a Components V2 message to a classic embed.")
-    async def slash_convert(self, interaction: discord.Interaction):
-        ref = interaction.message.reference if interaction.message else None
+    async def _target_from_reply(self, ctx: commands.Context) -> Optional[discord.Message]:
+        ref = ctx.message.reference
         if ref is None:
-            await interaction.response.send_message(
-                "❌ Reply to a Components V2 message first, then run this command.",
-                ephemeral=True,
-            )
-            return
+            return None
+        resolved = ref.resolved
+        if isinstance(resolved, discord.Message):
+            return resolved
         try:
-            target = ref.resolved or await interaction.channel.fetch_message(ref.message_id)
-        except discord.NotFound:
-            await interaction.response.send_message("❌ Could not fetch that message.", ephemeral=True)
+            return await ctx.channel.fetch_message(ref.message_id)
+        except discord.HTTPException:
+            return None
+
+    @commands.command(name="convert", aliases=["c"])
+    async def prefix_convert(self, ctx: commands.Context, message: Optional[discord.Message] = None):
+        """Reply to a Components V2 / forwarded message with this to convert it to an embed.
+        You can also pass a message link or ID instead of replying."""
+        target = message or await self._target_from_reply(ctx)
+        if target is None:
+            await ctx.reply("❌ **Reply** to the message you want to convert (or give a message link).",
+                            mention_author=False)
             return
-        try:
-            await interaction.response.defer()
-            intro, embeds = await self._do_convert(target)
-            await interaction.followup.send(content=intro, embeds=embeds)
-        except Exception as e:
-            await interaction.followup.send(f"❌ Error:\n```\n{type(e).__name__}: {e}\n```")
 
+        async with self._guard(target.id):
+            content, embeds = render(target, "manual")
+            if not embeds:
+                await ctx.reply("❌ Nothing to convert — that message has no text, images or files.",
+                                mention_author=False)
+                return
+            try:
+                sent = await ctx.reply(content=content, embeds=embeds,
+                                       allowed_mentions=NO_MENTIONS, mention_author=False)
+            except discord.HTTPException as e:
+                await ctx.reply(f"❌ Couldn't send the embed:\n```\n{e}\n```", mention_author=False)
+                return
+            await self._save_link(target, sent.id, sent.channel.id, "manual")
 
-    # ── Channel restriction commands ──────────────────────────────────────────
+    async def ctx_convert(self, interaction: discord.Interaction, message: discord.Message):
+        """Right-click a message → Apps → Convert to Embed."""
+        async with self._guard(message.id):
+            content, embeds = render(message, "manual")
+            if not embeds:
+                await interaction.response.send_message(
+                    "❌ Nothing to convert — that message has no text, images or files.", ephemeral=True
+                )
+                return
+            await interaction.response.send_message(content=content, embeds=embeds,
+                                                    allowed_mentions=NO_MENTIONS)
+            sent = await interaction.original_response()
+            await self._save_link(message, sent.id, sent.channel.id, "manual")
+
+    # ── Auto-convert channel list:  a!convertch  (alias a!cch) ──────────────
 
     @commands.group(name="convertch", aliases=["cch"], invoke_without_command=True)
+    @commands.guild_only()
     @commands.has_permissions(manage_guild=True)
     async def convertch(self, ctx: commands.Context):
-        """Manage which channels auto-conversion is allowed in."""
-        await ctx.send_help(ctx.command)
+        """Manage channels where V2 messages are converted automatically."""
+        await ctx.reply(
+            "**Auto-convert channels**\n"
+            "`convertch list` — show the list\n"
+            "`convertch add #chan [#chan …]` — turn auto-convert on\n"
+            "`convertch remove #chan [#chan …]` — turn it off\n"
+            "`convertch clear` — remove every channel\n"
+            "-# Only listed channels are converted automatically (threads follow their parent channel). "
+            "An empty list means auto-convert is off.",
+            mention_author=False,
+        )
 
     @convertch.command(name="list")
-    @commands.has_permissions(manage_guild=True)
     async def cch_list(self, ctx: commands.Context):
-        """Show allowed channels. Empty = conversion allowed everywhere."""
-        allowed = await self._get_allowed(ctx.guild.id)
-        if not allowed:
-            await ctx.reply("📋 No channel restrictions set — conversion runs in **all channels**.")
+        """Show the auto-convert channels."""
+        doc = await db.get_db().converter_channels.find_one({"guild_id": ctx.guild.id})
+        ids = doc.get("channel_ids", []) if doc else []
+        if not ids:
+            await ctx.reply("📋 No channels listed — auto-convert is **off** in this server.\n"
+                            "-# Add one with `convertch add #channel`. `!c` still works everywhere.",
+                            mention_author=False)
             return
-        mentions = []
-        for cid in sorted(allowed):
-            ch = ctx.guild.get_channel(cid)
-            mentions.append(ch.mention if ch else f"`{cid}` *(deleted)*")
-        e = discord.Embed(
-            title="📋 Converter Allowed Channels",
-            description="\n".join(mentions),
-            color=discord.Color.blurple(),
-        )
-        e.set_footer(text=f"{len(allowed)} channel(s) — conversion restricted to these only")
-        await ctx.reply(embed=e)
+        lines = []
+        for cid in ids:
+            ch = ctx.guild.get_channel_or_thread(cid)
+            lines.append(ch.mention if ch else f"`{cid}` *(deleted)*")
+        e = discord.Embed(title="📋 Auto-convert channels", description="\n".join(lines),
+                          color=discord.Color.blurple())
+        e.set_footer(text=f"{len(ids)} channel(s)")
+        await ctx.reply(embed=e, mention_author=False)
 
     @convertch.command(name="add")
-    @commands.has_permissions(manage_guild=True)
-    async def cch_add(self, ctx: commands.Context, *channels: discord.TextChannel):
-        """Add one or more channels to the allowed list.
-        Usage: a!convertch add #chan1 #chan2"""
+    async def cch_add(self, ctx: commands.Context, *channels: ConvertibleChannel):
+        """Add channels.  Usage: convertch add #chan1 #chan2"""
         if not channels:
-            await ctx.reply("❌ Please mention at least one channel.")
+            await ctx.reply("❌ Mention at least one channel.", mention_author=False)
             return
-        allowed = await self._get_allowed(ctx.guild.id)
-        added = []
-        already = []
-        for ch in channels:
-            if ch.id in allowed:
-                already.append(ch.mention)
-            else:
-                allowed.add(ch.id)
-                added.append(ch.mention)
-        await self._save_allowed(ctx.guild.id, allowed)
+        col = db.get_db().converter_channels
+        doc = await col.find_one({"guild_id": ctx.guild.id})
+        existing = set(doc.get("channel_ids", [])) if doc else set()
+        new = [c for c in channels if c.id not in existing]
+        old = [c for c in channels if c.id in existing]
+        if new:
+            await col.update_one(
+                {"guild_id": ctx.guild.id},
+                {"$addToSet": {"channel_ids": {"$each": [c.id for c in new]}}},
+                upsert=True,
+            )
         parts = []
-        if added:
-            parts.append(f"✅ Added: {', '.join(added)}")
-        if already:
-            parts.append(f"ℹ️ Already in list: {', '.join(already)}")
-        await ctx.reply("\n".join(parts))
+        if new:
+            parts.append("✅ Auto-convert **on** in: " + ", ".join(c.mention for c in new))
+        if old:
+            parts.append("ℹ️ Already in the list: " + ", ".join(c.mention for c in old))
+        await ctx.reply("\n".join(parts), mention_author=False)
 
-    @convertch.command(name="remove")
-    @commands.has_permissions(manage_guild=True)
-    async def cch_remove(self, ctx: commands.Context, *channels: discord.TextChannel):
-        """Remove one or more channels from the allowed list.
-        Usage: a!convertch remove #chan1 #chan2"""
+    @convertch.command(name="remove", aliases=["rm"])
+    async def cch_remove(self, ctx: commands.Context, *channels: ConvertibleChannel):
+        """Remove channels.  Usage: convertch remove #chan1 #chan2"""
         if not channels:
-            await ctx.reply("❌ Please mention at least one channel.")
+            await ctx.reply("❌ Mention at least one channel.", mention_author=False)
             return
-        allowed = await self._get_allowed(ctx.guild.id)
-        removed = []
-        missing = []
-        for ch in channels:
-            if ch.id in allowed:
-                allowed.discard(ch.id)
-                removed.append(ch.mention)
-            else:
-                missing.append(ch.mention)
-        await self._save_allowed(ctx.guild.id, allowed)
+        col = db.get_db().converter_channels
+        doc = await col.find_one({"guild_id": ctx.guild.id})
+        existing = set(doc.get("channel_ids", [])) if doc else set()
+        gone = [c for c in channels if c.id in existing]
+        missing = [c for c in channels if c.id not in existing]
+        if gone:
+            await col.update_one(
+                {"guild_id": ctx.guild.id},
+                {"$pull": {"channel_ids": {"$in": [c.id for c in gone]}}},
+            )
         parts = []
-        if removed:
-            parts.append(f"✅ Removed: {', '.join(removed)}")
+        if gone:
+            parts.append("✅ Removed: " + ", ".join(c.mention for c in gone))
         if missing:
-            parts.append(f"ℹ️ Not in list: {', '.join(missing)}")
-        if not allowed:
-            parts.append("⚠️ List is now empty — conversion will run in **all channels**.")
-        await ctx.reply("\n".join(parts))
+            parts.append("ℹ️ Wasn't in the list: " + ", ".join(c.mention for c in missing))
+        if gone and len(existing) == len(gone):
+            parts.append("⚠️ List is now empty — auto-convert is **off**.")
+        await ctx.reply("\n".join(parts), mention_author=False)
 
     @convertch.command(name="clear")
-    @commands.has_permissions(manage_guild=True)
     async def cch_clear(self, ctx: commands.Context):
-        """Clear all channel restrictions — conversion will run everywhere again."""
-        await self._save_allowed(ctx.guild.id, set())
-        await ctx.reply("🗑️ Channel restrictions cleared — conversion is now allowed in **all channels**.")
+        """Remove every channel (auto-convert off)."""
+        await db.get_db().converter_channels.update_one(
+            {"guild_id": ctx.guild.id}, {"$set": {"channel_ids": []}}, upsert=True
+        )
+        await ctx.reply("🗑️ List cleared — auto-convert is now **off** in this server.", mention_author=False)
 
-    @convertch.error
-    async def cch_error(self, ctx: commands.Context, error):
+    async def cog_command_error(self, ctx: commands.Context, error: commands.CommandError):
         if isinstance(error, commands.MissingPermissions):
-            await ctx.reply("❌ You need **Manage Guild** permission to use this.")
-        else:
-            raise error
+            await ctx.reply("❌ You need **Manage Server** permission to use this.", mention_author=False)
+        elif isinstance(error, commands.NoPrivateMessage):
+            await ctx.reply("❌ This command only works in a server.", mention_author=False)
+        elif isinstance(error, (commands.BadUnionArgument, commands.ChannelNotFound)):
+            await ctx.reply("❌ I couldn't find that channel — mention a text/voice/forum channel.",
+                            mention_author=False)
+
+
+class _FakeResponse:
+    """Minimal stand-in so we can raise discord.NotFound ourselves."""
+    status = 404
+    reason = "Not Found"
 
 
 async def setup(bot: commands.Bot):
