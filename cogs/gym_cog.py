@@ -48,7 +48,9 @@ import discord
 from discord.ext import commands
 
 from .battle.constants import LEVEL, GYM_TYPES, GYM_TYPE_EMOJI, GYM_BADGE_NAME, GYM_TOTAL_BADGES
-from .battle.pokeapi import get_pokemon_data, pick_moves, build_gym_team
+from .battle.pokeapi import (
+    get_pokemon_data, pick_moves, build_gym_team, retune_moves_against,
+)
 from .battle.engine import BattlePokemon
 import random
 from .battle.trainer_ai import Trainer, pick_best_replacement
@@ -279,6 +281,14 @@ class GymCog(commands.Cog, name="Gym"):
             f"and is picking their counters..."
         )
         ai_team = await build_gym_team(self.session, pending.gym_type, pending.team, pending.count)
+
+        # Now that the gym leader's team is known, re-tune the challenger's
+        # movesets to hit it (priority moves kept). Best-effort: on any
+        # failure the challenger just keeps their original moves.
+        try:
+            await retune_moves_against(self.session, pending.team, ai_team)
+        except Exception:
+            pass
 
         # Difficulty scales with how many badges the challenger already holds.
         guild_id = ctx.guild.id if ctx.guild else 0
